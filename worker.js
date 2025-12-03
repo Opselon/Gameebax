@@ -29,9 +29,9 @@ const CONFIG = {
   DEFAULT_META_DESCRIPTION: "فروش ویژه بازی‌ها و اکانت‌های PS4/PS5 با تحویل فوری و ضمانت.",
 };
 
-// Example wrangler.toml binding for D1 (comment only, keep env.DB)
+// Example wrangler.toml binding for D1 (comment only, keep env.games)
 // [[d1_databases]]
-// binding = "DB"
+// binding = "games"
 // database_name = "games-db"
 // database_id = "<your-database-id>"
 
@@ -137,19 +137,19 @@ async function getAllGames(env, filters = {}) {
     params.push(`%${filters.title}%`);
   }
   const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
-  const stmt = env.DB.prepare(`SELECT * FROM games ${where} ORDER BY id DESC`);
+  const stmt = env.games.prepare(`SELECT * FROM games ${where} ORDER BY id DESC`);
   const result = await stmt.bind(...params).all();
   return result.results || [];
 }
 
 async function getGameById(env, id) {
-  const stmt = env.DB.prepare("SELECT * FROM games WHERE id = ? LIMIT 1");
+  const stmt = env.games.prepare("SELECT * FROM games WHERE id = ? LIMIT 1");
   const result = await stmt.bind(id).first();
   return result || null;
 }
 
 async function createGame(env, data) {
-  const stmt = env.DB.prepare(`
+  const stmt = env.games.prepare(`
     INSERT INTO games (
       title, platform, region, capacity, is_plus, price, stock, active,
       image_url, description, seo_title, seo_description, seo_tags
@@ -173,7 +173,7 @@ async function createGame(env, data) {
 }
 
 async function updateGame(env, id, data) {
-  const stmt = env.DB.prepare(`
+  const stmt = env.games.prepare(`
     UPDATE games SET
       title = ?, platform = ?, region = ?, capacity = ?, is_plus = ?, price = ?,
       stock = ?, active = ?, image_url = ?, description = ?, seo_title = ?,
@@ -199,13 +199,18 @@ async function updateGame(env, id, data) {
 }
 
 async function softDeleteGame(env, id) {
-  const stmt = env.DB.prepare("UPDATE games SET active = 0 WHERE id = ?");
+  const stmt = env.games.prepare("UPDATE games SET active = 0 WHERE id = ?");
   await stmt.bind(id).run();
 }
 
 async function updateStock(env, id, newStock) {
-  const stmt = env.DB.prepare("UPDATE games SET stock = ? WHERE id = ?");
+  const stmt = env.games.prepare("UPDATE games SET stock = ? WHERE id = ?");
   await stmt.bind(newStock, id).run();
+}
+
+async function listRecentOrders(env) {
+  const stmt = env.games.prepare("SELECT * FROM [Order] ORDER LIMIT 100");
+  return stmt.run();
 }
 
 // ============================================================
@@ -717,6 +722,12 @@ async function handleRequest(request, env, ctx) {
   if (url.pathname === "/store" && request.method === "GET") {
     const games = await listPublicGames(env);
     return htmlResponse(renderStorefront(games));
+  }
+
+  // Orders preview (D1 sample query)
+  if (url.pathname === "/orders" && request.method === "GET") {
+    const result = await listRecentOrders(env);
+    return jsonResponse(result);
   }
 
   // Game detail
@@ -2413,24 +2424,31 @@ self.addEventListener('fetch', (event) => {
     if (event.request.method !== 'GET') return;
 
     event.respondWith(
-        caches.match(event.request).then((cachedResponse) => {
-            // Strategy: Stale-While-Revalidate
-            // Return cached response immediately if available
-            const fetchPromise = fetch(event.request).then((networkResponse) => {
+        (async () => {
+            const cachedResponse = await caches.match(event.request);
+
+            try {
+                const networkResponse = await fetch(event.request);
+
                 // Update the cache with the fresh response
                 if (networkResponse && networkResponse.status === 200 && networkResponse.type === 'basic') {
                     const responseClone = networkResponse.clone();
-                    caches.open(CACHE_NAME).then((cache) => {
-                        cache.put(event.request, responseClone);
-                    });
+                    const cache = await caches.open(CACHE_NAME);
+                    cache.put(event.request, responseClone);
                 }
-                return networkResponse;
-            }).catch(() => {
-                // If network fails and no cache, just return undefined (browser handles error)
-            });
 
-            return cachedResponse || fetchPromise;
-        })
+                // Prefer cached response for speed, otherwise network result
+                return cachedResponse || networkResponse;
+            } catch (error) {
+                // Ensure a Response is always returned to avoid TypeError in respondWith
+                if (cachedResponse) return cachedResponse;
+                return new Response('Offline', {
+                    status: 503,
+                    statusText: 'Service Unavailable',
+                    headers: { 'Content-Type': 'text/plain;charset=UTF-8' }
+                });
+            }
+        })()
     );
 });
 `;
