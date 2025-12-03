@@ -1,11 +1,11 @@
 /**
  * ⚔️ GALAXY ZONE: GOD OF WAR EDITION ⚔️
  * Version: 4.0.0 (Ultimate Spartan)
- * 
+ *
  * This Worker serves a highly optimized Single Page Application (PWA).
  * Architecture: Server-Side Rendering (SSR) Shell + Client-Side Hydration.
  * Tech Stack: Vanilla JS (ES6+), Three.js, CSS3 Variables.
- * 
+ *
  * FEATURES:
  * - 3D Interactive Background (Three.js)
  * - Event-Driven Architecture
@@ -14,8 +14,749 @@
  * - Fully Responsive & Touch Optimized
  */
 
+// ============================================================
+// SECTION 0: CONFIG & HELPERS (Non-destructive additions)
+// ============================================================
+// NOTE: Existing logic remains untouched. New helpers live alongside
+// the legacy PWA routes to enable D1-powered admin tooling.
+
+const CONFIG = {
+  ADMIN_USERNAME: "Sardar",
+  ADMIN_PASSWORD: "Sardar2266",
+  ADMIN_SESSION_COOKIE: "admin_session",
+  SESSION_VALUE: "galaxyzone-admin",
+  COOKIE_MAX_AGE: 60 * 60 * 24, // 1 day
+  DEFAULT_META_DESCRIPTION: "فروش ویژه بازی‌ها و اکانت‌های PS4/PS5 با تحویل فوری و ضمانت.",
+};
+
+// Example wrangler.toml binding for D1 (comment only, keep env.DB)
+// [[d1_databases]]
+// binding = "DB"
+// database_name = "games-db"
+// database_id = "<your-database-id>"
+
+function jsonResponse(data, status = 200, headers = {}) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "Content-Type": "application/json;charset=UTF-8", ...headers },
+  });
+}
+
+function htmlResponse(html, status = 200, headers = {}) {
+  return new Response(html, {
+    status,
+    headers: { "Content-Type": "text/html;charset=UTF-8", ...headers },
+  });
+}
+
+function redirectResponse(location, status = 302, headers = {}) {
+  return new Response(null, {
+    status,
+    headers: { Location: location, ...headers },
+  });
+}
+
+function getCookie(request, name) {
+  const cookieHeader = request.headers.get("Cookie") || "";
+  const cookies = Object.fromEntries(
+    cookieHeader.split(";").map((c) => {
+      const [k, ...v] = c.trim().split("=");
+      return [k, v.join("=")];
+    }).filter(([k]) => k)
+  );
+  return cookies[name];
+}
+
+function serializeCookie(name, value, options = {}) {
+  const parts = [`${name}=${value}`];
+  if (options.maxAge) parts.push(`Max-Age=${options.maxAge}`);
+  if (options.path) parts.push(`Path=${options.path}`);
+  if (options.httpOnly) parts.push("HttpOnly");
+  if (options.secure) parts.push("Secure");
+  if (options.sameSite) parts.push(`SameSite=${options.sameSite}`);
+  return parts.join("; ");
+}
+
+function formatPrice(value) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) return "-";
+  return Number(value).toLocaleString("fa-IR");
+}
+
+function truncate(text, length = 80) {
+  if (!text) return "";
+  return text.length > length ? `${text.slice(0, length)}…` : text;
+}
+
+function parseBoolean(input) {
+  if (typeof input === "boolean") return input;
+  if (typeof input === "number") return Boolean(input);
+  if (typeof input === "string") {
+    return ["1", "true", "on", "yes"].includes(input.toLowerCase());
+  }
+  return false;
+}
+
+async function parseFormData(request) {
+  const formData = await request.formData();
+  const obj = {};
+  for (const [key, value] of formData.entries()) {
+    obj[key] = value;
+  }
+  return obj;
+}
+
+// ============================================================
+// SECTION 1: DATABASE LAYER (D1 helpers)
+// ============================================================
+
+function getDb(env) {
+  const db = env.DB || env.games;
+  if (!db) {
+    throw new Error("D1 binding not configured; expected env.DB or env.games");
+  }
+  return db;
+}
+
+async function getAllGames(env, filters = {}) {
+  const conditions = [];
+  const params = [];
+  if (filters.platform) {
+    conditions.push("platform = ?");
+    params.push(filters.platform);
+  }
+  if (filters.region) {
+    conditions.push("region = ?");
+    params.push(filters.region);
+  }
+  if (filters.capacity) {
+    conditions.push("capacity = ?");
+    params.push(filters.capacity);
+  }
+  if (filters.is_plus !== undefined) {
+    conditions.push("is_plus = ?");
+    params.push(filters.is_plus ? 1 : 0);
+  }
+  if (filters.active !== undefined) {
+    conditions.push("active = ?");
+    params.push(filters.active ? 1 : 0);
+  }
+  if (filters.title) {
+    conditions.push("title LIKE ?");
+    params.push(`%${filters.title}%`);
+  }
+  const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+  const stmt = getDb(env).prepare(`SELECT * FROM games ${where} ORDER BY id DESC`);
+  const result = await stmt.bind(...params).all();
+  return result.results || [];
+}
+
+async function getGameById(env, id) {
+  const stmt = getDb(env).prepare("SELECT * FROM games WHERE id = ? LIMIT 1");
+  const result = await stmt.bind(id).first();
+  return result || null;
+}
+
+async function createGame(env, data) {
+  const stmt = getDb(env).prepare(`
+    INSERT INTO games (
+      title, platform, region, capacity, is_plus, price, stock, active,
+      image_url, description, seo_title, seo_description, seo_tags
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  await stmt.bind(
+    data.title,
+    data.platform,
+    data.region,
+    data.capacity,
+    data.is_plus ? 1 : 0,
+    data.price,
+    data.stock,
+    data.active ? 1 : 0,
+    data.image_url || null,
+    data.description || null,
+    data.seo_title || null,
+    data.seo_description || null,
+    data.seo_tags || null,
+  ).run();
+}
+
+async function updateGame(env, id, data) {
+  const stmt = getDb(env).prepare(`
+    UPDATE games SET
+      title = ?, platform = ?, region = ?, capacity = ?, is_plus = ?, price = ?,
+      stock = ?, active = ?, image_url = ?, description = ?, seo_title = ?,
+      seo_description = ?, seo_tags = ?
+    WHERE id = ?
+  `);
+  await stmt.bind(
+    data.title,
+    data.platform,
+    data.region,
+    data.capacity,
+    data.is_plus ? 1 : 0,
+    data.price,
+    data.stock,
+    data.active ? 1 : 0,
+    data.image_url || null,
+    data.description || null,
+    data.seo_title || null,
+    data.seo_description || null,
+    data.seo_tags || null,
+    id,
+  ).run();
+}
+
+async function softDeleteGame(env, id) {
+  const stmt = getDb(env).prepare("UPDATE games SET active = 0 WHERE id = ?");
+  await stmt.bind(id).run();
+}
+
+async function updateStock(env, id, newStock) {
+  const stmt = getDb(env).prepare("UPDATE games SET stock = ? WHERE id = ?");
+  await stmt.bind(newStock, id).run();
+}
+
+// ============================================================
+// SECTION 2: SERVICE / BUSINESS LOGIC
+// ============================================================
+
+function normalizeGamePayload(data) {
+  const requiredFields = ["title", "platform", "region", "capacity", "price", "stock"];
+  for (const field of requiredFields) {
+    if (!data[field]) throw new Error(`Missing required field: ${field}`);
+  }
+  const capacityNumber = Number(data.capacity);
+  const priceNumber = Number(data.price);
+  const stockNumber = Number(data.stock);
+  return {
+    title: data.title,
+    platform: data.platform,
+    region: data.region,
+    capacity: Number.isNaN(capacityNumber) ? 0 : capacityNumber,
+    is_plus: parseBoolean(data.is_plus),
+    price: Number.isNaN(priceNumber) ? 0 : priceNumber,
+    stock: Number.isNaN(stockNumber) ? 0 : stockNumber,
+    active: parseBoolean(data.active ?? true),
+    image_url: data.image_url || "",
+    description: data.description || "",
+    seo_title: data.seo_title || data.title,
+    seo_description: data.seo_description || data.description || CONFIG.DEFAULT_META_DESCRIPTION,
+    seo_tags: data.seo_tags || "",
+  };
+}
+
+async function listPublicGames(env, filters = {}) {
+  const games = await getAllGames(env, { ...filters, active: true });
+  return games.map((g) => ({
+    ...g,
+    is_plus: Boolean(g.is_plus),
+    out_of_stock: Number(g.stock) <= 0,
+    display_price: formatPrice(g.price),
+    seo_title: g.seo_title || g.title,
+    seo_description: g.seo_description || g.description || CONFIG.DEFAULT_META_DESCRIPTION,
+  }));
+}
+
+async function listAdminGames(env, filters = {}) {
+  const games = await getAllGames(env, filters);
+  return games.map((g) => ({ ...g, is_plus: Boolean(g.is_plus) }));
+}
+
+async function createGameFromForm(env, request) {
+  const payload = normalizeGamePayload(await parseFormData(request));
+  await createGame(env, payload);
+}
+
+async function updateGameFromForm(env, id, request) {
+  const payload = normalizeGamePayload(await parseFormData(request));
+  await updateGame(env, id, payload);
+}
+
+// ============================================================
+// SECTION 3: AUTHENTICATION LAYER
+// ============================================================
+
+function isAuthenticated(request) {
+  const cookie = getCookie(request, CONFIG.ADMIN_SESSION_COOKIE);
+  return cookie === CONFIG.SESSION_VALUE;
+}
+
+async function handleLogin(request) {
+  if (request.method !== "POST") return null;
+  const data = await parseFormData(request);
+  if (data.username === CONFIG.ADMIN_USERNAME && data.password === CONFIG.ADMIN_PASSWORD) {
+    const cookie = serializeCookie(CONFIG.ADMIN_SESSION_COOKIE, CONFIG.SESSION_VALUE, {
+      path: "/",
+      httpOnly: true,
+      sameSite: "Lax",
+      maxAge: CONFIG.COOKIE_MAX_AGE,
+    });
+    return redirectResponse("/admin", 302, { "Set-Cookie": cookie });
+  }
+  return htmlResponse(renderAdminLoginPage("نام کاربری یا رمز عبور اشتباه است"), 401);
+}
+
+function handleLogout() {
+  const cookie = serializeCookie(CONFIG.ADMIN_SESSION_COOKIE, "", { path: "/", maxAge: 0 });
+  return redirectResponse("/admin/login", 302, { "Set-Cookie": cookie });
+}
+
+// ============================================================
+// SECTION 4: HTML RENDER HELPERS
+// ============================================================
+
+function renderLayout(content, { title = "GalaxyZone Admin", metaDescription = CONFIG.DEFAULT_META_DESCRIPTION } = {}) {
+  return `<!DOCTYPE html>
+  <html lang="fa" dir="rtl">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>${title}</title>
+    <meta name="description" content="${metaDescription}" />
+    <style>
+      body { font-family: 'Vazirmatn', sans-serif; background:#0b0d1a; color:#e9ecf5; margin:0; padding:0; }
+      header { background:#101531; padding:12px 20px; display:flex; justify-content:space-between; align-items:center; position:sticky; top:0; z-index:10; }
+      a { color:#6be1ff; text-decoration:none; }
+      table { width:100%; border-collapse:collapse; margin-top:12px; }
+      th, td { border:1px solid #1f2a55; padding:8px; text-align:right; }
+      th { background:#151a3d; }
+      tr:nth-child(even) { background:#111633; }
+      .container { max-width:1200px; margin:0 auto; padding:16px; }
+      .btn { display:inline-block; padding:8px 12px; background:#1e88e5; color:#fff; border-radius:6px; border:none; cursor:pointer; }
+      .btn-secondary { background:#3949ab; }
+      .btn-danger { background:#e53935; }
+      .btn-ghost { background:transparent; color:#fff; border:1px solid #6be1ff; }
+      form { margin-top:12px; }
+      label { display:block; margin-top:8px; }
+      input, select, textarea { width:100%; padding:8px; margin-top:4px; border-radius:6px; border:1px solid #2a335e; background:#0f142d; color:#fff; }
+      textarea { min-height:80px; }
+      .grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(240px, 1fr)); gap:12px; }
+      .badge { display:inline-block; padding:2px 8px; border-radius:8px; background:#2e7d32; color:#fff; font-size:12px; }
+      .plus { background:#c2185b; }
+      .muted { color:#9ea7c6; font-size:12px; }
+      .alert { padding:10px; border-radius:8px; background:#18204a; border:1px solid #2f3d75; margin-top:10px; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div><strong>GalaxyZone Admin</strong></div>
+      <nav>
+        <a href="/admin" style="margin-left:10px;">داشبورد</a>
+        <form method="POST" action="/admin/logout" style="display:inline;">
+          <button class="btn btn-ghost" type="submit">خروج</button>
+        </form>
+      </nav>
+    </header>
+    <div class="container">${content}</div>
+  </body>
+  </html>`;
+}
+
+function renderAdminLoginPage(errorMessage = "") {
+  const errorBlock = errorMessage ? `<div class="alert">${errorMessage}</div>` : "";
+  return `<!DOCTYPE html>
+  <html lang="fa" dir="rtl">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ورود ادمین</title>
+    <style>
+      body { font-family: 'Vazirmatn', sans-serif; background:#0b0d1a; color:#e9ecf5; display:flex; align-items:center; justify-content:center; height:100vh; margin:0; }
+      .card { background:#101531; padding:24px; border-radius:12px; width:320px; box-shadow:0 10px 40px rgba(0,0,0,0.4); }
+      label { display:block; margin-top:12px; }
+      input { width:100%; padding:10px; margin-top:6px; border-radius:8px; border:1px solid #1f2a55; background:#0f142d; color:#fff; }
+      button { width:100%; padding:12px; margin-top:16px; border:none; border-radius:8px; background:#1e88e5; color:#fff; cursor:pointer; }
+      .muted { color:#9ea7c6; font-size:12px; }
+      .alert { padding:10px; border-radius:8px; background:#18204a; border:1px solid #2f3d75; margin-top:10px; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h2>ورود مدیریت</h2>
+      ${errorBlock}
+      <form method="POST" action="/admin/login">
+        <label>نام کاربری
+          <input required name="username" />
+        </label>
+        <label>رمز عبور
+          <input required name="password" type="password" />
+        </label>
+        <button type="submit">ورود</button>
+        <p class="muted">یوزرنیم: ${CONFIG.ADMIN_USERNAME} | پسورد: ${CONFIG.ADMIN_PASSWORD}</p>
+      </form>
+    </div>
+  </body>
+  </html>`;
+}
+
+function renderAdminDashboard(games, filters = {}) {
+  const rows = games
+    .map(
+      (g) => `<tr>
+        <td>${g.id}</td>
+        <td>${g.title}</td>
+        <td>${g.platform}</td>
+        <td>${g.region}</td>
+        <td>${g.capacity}</td>
+        <td>${g.is_plus ? '<span class="badge plus">+Plus</span>' : ''}</td>
+        <td>${formatPrice(g.price)}</td>
+        <td>
+          <form method="POST" action="/admin/games/${g.id}/stock" style="display:flex; gap:6px; align-items:center;">
+            <input type="number" name="stock" value="${g.stock}" style="width:90px;" />
+            <button class="btn btn-secondary" type="submit">بروزرسانی</button>
+          </form>
+        </td>
+        <td>${g.active ? '<span class="badge">فعال</span>' : '<span class="badge" style="background:#c62828;">غیرفعال</span>'}</td>
+        <td>${g.image_url ? '<a href="' + g.image_url + '" target="_blank">لینک</a>' : '-'}</td>
+        <td>${truncate(g.description, 50)}</td>
+        <td>${g.seo_title || '-'}</td>
+        <td>${truncate(g.seo_description, 60)}</td>
+        <td>${g.seo_tags || '-'}</td>
+        <td>
+          <a class="btn btn-secondary" href="/admin/games/${g.id}">ویرایش</a>
+          <form method="POST" action="/admin/games/${g.id}/delete" style="display:inline;">
+            <button class="btn btn-danger" type="submit">حذف نرم</button>
+          </form>
+          <form method="POST" action="/admin/games/${g.id}" style="display:inline;">
+            <input type="hidden" name="title" value="${g.title}" />
+            <input type="hidden" name="platform" value="${g.platform}" />
+            <input type="hidden" name="region" value="${g.region}" />
+            <input type="hidden" name="capacity" value="${g.capacity}" />
+            <input type="hidden" name="is_plus" value="${g.is_plus ? 1 : 0}" />
+            <input type="hidden" name="price" value="${g.price}" />
+            <input type="hidden" name="stock" value="${g.stock}" />
+            <input type="hidden" name="active" value="${g.active ? 0 : 1}" />
+            <input type="hidden" name="image_url" value="${g.image_url || ''}" />
+            <input type="hidden" name="description" value="${g.description || ''}" />
+            <input type="hidden" name="seo_title" value="${g.seo_title || ''}" />
+            <input type="hidden" name="seo_description" value="${g.seo_description || ''}" />
+            <input type="hidden" name="seo_tags" value="${g.seo_tags || ''}" />
+            <button class="btn" type="submit">${g.active ? 'Deactivate' : 'Activate'}</button>
+          </form>
+        </td>
+      </tr>`
+    )
+    .join("");
+
+  const filterTitle = filters.title || "";
+  const filterPlatform = filters.platform || "";
+  const filterActive = filters.active ?? "";
+
+  const content = `
+    <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px;">
+      <h2>مدیریت بازی‌ها</h2>
+      <a class="btn" href="/admin/games/new">ایجاد بازی جدید</a>
+    </div>
+    <form method="GET" action="/admin" class="grid" style="align-items:end;">
+      <div>
+        <label>عنوان
+          <input name="title" value="${filterTitle}" />
+        </label>
+      </div>
+      <div>
+        <label>پلتفرم
+          <select name="platform">
+            <option value="">همه</option>
+            <option value="PS4" ${filterPlatform === 'PS4' ? 'selected' : ''}>PS4</option>
+            <option value="PS5" ${filterPlatform === 'PS5' ? 'selected' : ''}>PS5</option>
+          </select>
+        </label>
+      </div>
+      <div>
+        <label>وضعیت نمایش
+          <select name="active">
+            <option value="" ${filterActive === '' ? 'selected' : ''}>همه</option>
+            <option value="1" ${filterActive === '1' ? 'selected' : ''}>فعال</option>
+            <option value="0" ${filterActive === '0' ? 'selected' : ''}>غیرفعال</option>
+          </select>
+        </label>
+      </div>
+      <div>
+        <button class="btn" type="submit">اعمال فیلتر</button>
+      </div>
+    </form>
+    <div class="muted">${games.length} نتیجه</div>
+    <div style="overflow:auto;">
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th><th>عنوان</th><th>پلتفرم</th><th>ریجن</th><th>ظرفیت</th><th>Plus</th><th>قیمت</th><th>موجودی</th><th>فعال</th><th>تصویر</th><th>توضیح</th><th>SEO Title</th><th>SEO Description</th><th>SEO Tags</th><th>اقدام</th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+  `;
+  return renderLayout(content, { title: "Admin | Games" });
+}
+
+function renderAdminGameForm(game = null) {
+  const isEdit = Boolean(game);
+  const action = isEdit ? `/admin/games/${game.id}` : "/admin/games";
+  return renderLayout(`
+    <h2>${isEdit ? "ویرایش بازی" : "ایجاد بازی"}</h2>
+    <form method="POST" action="${action}">
+      <div class="grid">
+        <label>عنوان
+          <input required name="title" value="${game?.title || ""}" />
+        </label>
+        <label>پلتفرم
+          <select name="platform" required>
+            <option value="PS4" ${game?.platform === "PS4" ? "selected" : ""}>PS4</option>
+            <option value="PS5" ${game?.platform === "PS5" ? "selected" : ""}>PS5</option>
+          </select>
+        </label>
+        <label>ریجن
+          <input required name="region" value="${game?.region || ""}" />
+        </label>
+        <label>ظرفیت
+          <input required type="number" name="capacity" value="${game?.capacity || 2}" />
+        </label>
+        <label>+Plus
+          <input type="checkbox" name="is_plus" ${game?.is_plus ? "checked" : ""} />
+        </label>
+        <label>قیمت
+          <input required type="number" name="price" value="${game?.price || 0}" />
+        </label>
+        <label>موجودی
+          <input required type="number" name="stock" value="${game?.stock || 0}" />
+        </label>
+        <label>فعال
+          <input type="checkbox" name="active" ${game?.active ? "checked" : ""} />
+        </label>
+        <label>لینک تصویر
+          <input name="image_url" value="${game?.image_url || ""}" />
+        </label>
+        <label>SEO Title
+          <input name="seo_title" value="${game?.seo_title || ""}" />
+        </label>
+        <label>SEO Description
+          <textarea name="seo_description">${game?.seo_description || ""}</textarea>
+        </label>
+        <label>SEO Tags (comma-separated)
+          <input name="seo_tags" value="${game?.seo_tags || ""}" />
+        </label>
+      </div>
+      <label>توضیح کامل
+        <textarea name="description">${game?.description || ""}</textarea>
+      </label>
+      <button class="btn" type="submit">${isEdit ? "ثبت تغییرات" : "ایجاد"}</button>
+      <a class="btn btn-secondary" href="/admin">بازگشت</a>
+    </form>
+  `, { title: isEdit ? `Edit ${game.title}` : "Create Game" });
+}
+
+function renderStorefront(games) {
+  const cards = games
+    .map(
+      (g) => `<article style="background:#0f132b; border:1px solid #1f2a55; padding:12px; border-radius:12px;">
+        <h3>${g.title} ${g.is_plus ? '<span class="badge plus">+Plus</span>' : ''}</h3>
+        <div class="muted">${g.platform} | ${g.region} | ظرفیت ${g.capacity}</div>
+        ${g.image_url ? `<img src="${g.image_url}" alt="${g.title}" style="max-width:100%; border-radius:10px; margin:8px 0;" />` : ''}
+        <p>${truncate(g.description, 120)}</p>
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <strong>${g.display_price} تومان</strong>
+          ${g.out_of_stock ? '<span class="badge" style="background:#c62828;">ناموجود</span>' : '<span class="badge">موجود</span>'}
+        </div>
+        <div class="muted">برچسب‌ها: ${g.seo_tags || '---'}</div>
+      </article>`
+    )
+    .join("");
+
+  return `<!DOCTYPE html>
+  <html lang="fa" dir="rtl">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>فروشگاه بازی | GalaxyZone</title>
+    <meta name="description" content="${CONFIG.DEFAULT_META_DESCRIPTION}" />
+    <style>
+      body { font-family:'Vazirmatn', sans-serif; background:#0b0d1a; color:#e9ecf5; margin:0; }
+      .container { max-width:1100px; margin:0 auto; padding:16px; }
+      h1 { margin:0 0 12px 0; }
+      .grid { display:grid; gap:12px; grid-template-columns:repeat(auto-fit, minmax(260px, 1fr)); }
+      .badge { display:inline-block; padding:2px 8px; border-radius:8px; background:#2e7d32; color:#fff; font-size:12px; }
+      .plus { background:#c2185b; }
+      .muted { color:#9ea7c6; font-size:12px; }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h1>فروشگاه بازی‌ها</h1>
+      <p class="muted">داده‌ها مستقیماً از Cloudflare D1 بارگذاری می‌شوند.</p>
+      <div class="grid">${cards}</div>
+    </div>
+  </body>
+  </html>`;
+}
+
+function renderGameDetail(game) {
+  return `<!DOCTYPE html>
+  <html lang="fa" dir="rtl">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>${game.seo_title || game.title}</title>
+    <meta name="description" content="${game.seo_description || game.description || CONFIG.DEFAULT_META_DESCRIPTION}" />
+    <style>
+      body { font-family:'Vazirmatn', sans-serif; background:#0b0d1a; color:#e9ecf5; margin:0; }
+      .container { max-width:800px; margin:0 auto; padding:16px; }
+      img { max-width:100%; border-radius:12px; }
+      .badge { display:inline-block; padding:2px 8px; border-radius:8px; background:#2e7d32; color:#fff; font-size:12px; }
+      .plus { background:#c2185b; }
+      .muted { color:#9ea7c6; font-size:12px; }
+      .tag { display:inline-block; margin:2px; padding:4px 8px; background:#0f142d; border:1px solid #1f2a55; border-radius:6px; }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <a href="/store" class="muted">بازگشت به فروشگاه</a>
+      <h1>${game.title} ${game.is_plus ? '<span class="badge plus">+Plus</span>' : ''}</h1>
+      <div class="muted">${game.platform} | ${game.region} | ظرفیت ${game.capacity}</div>
+      ${game.image_url ? `<img src="${game.image_url}" alt="${game.title}" />` : ''}
+      <p>${game.description || ''}</p>
+      <div><strong>قیمت:</strong> ${formatPrice(game.price)} تومان</div>
+      <div class="muted">${game.out_of_stock ? 'ناموجود' : 'موجود'}</div>
+      <div>${(game.seo_tags || '').split(',').filter(Boolean).map((t) => `<span class="tag">${t.trim()}</span>`).join('')}</div>
+    </div>
+  </body>
+  </html>`;
+}
+
+// ============================================================
+// SECTION 5: ROUTING (New paths layered before legacy router)
+// ============================================================
+
+async function handleRequest(request, env, ctx) {
+  const url = new URL(request.url);
+
+  // Admin authentication routes
+  if (url.pathname === "/admin/login") {
+    if (request.method === "GET") return htmlResponse(renderAdminLoginPage());
+    return await handleLogin(request);
+  }
+
+  if (url.pathname === "/admin/logout" && request.method === "POST") {
+    return handleLogout();
+  }
+
+  // All /admin* (except /admin/login) require auth
+  if (url.pathname.startsWith("/admin")) {
+    if (!isAuthenticated(request)) {
+      return redirectResponse("/admin/login");
+    }
+
+    // Admin dashboard listing
+    if (url.pathname === "/admin" && request.method === "GET") {
+      const filters = {
+        title: url.searchParams.get("title") || undefined,
+        platform: url.searchParams.get("platform") || undefined,
+        active: url.searchParams.get("active") === null || url.searchParams.get("active") === ""
+          ? undefined
+          : url.searchParams.get("active") === "1",
+      };
+      const games = await listAdminGames(env, filters);
+      return htmlResponse(renderAdminDashboard(games, filters));
+    }
+
+    // New game form
+    if (url.pathname === "/admin/games/new" && request.method === "GET") {
+      return htmlResponse(renderAdminGameForm());
+    }
+
+    // Create game
+    if (url.pathname === "/admin/games" && request.method === "POST") {
+      try {
+        await createGameFromForm(env, request);
+        return redirectResponse("/admin");
+      } catch (err) {
+        return htmlResponse(renderLayout(`<div class="alert">${err.message}</div>`));
+      }
+    }
+
+    // Edit form
+    const gameIdMatch = url.pathname.match(/^\/admin\/games\/(\d+)$/);
+    if (gameIdMatch && request.method === "GET") {
+      const game = await getGameById(env, gameIdMatch[1]);
+      if (!game) return htmlResponse(renderLayout("بازی یافت نشد", { title: "404" }), 404);
+      return htmlResponse(renderAdminGameForm(game));
+    }
+
+    // Update game
+    if (gameIdMatch && request.method === "POST") {
+      try {
+        await updateGameFromForm(env, gameIdMatch[1], request);
+        return redirectResponse("/admin");
+      } catch (err) {
+        return htmlResponse(renderLayout(`<div class=\"alert\">${err.message}</div>`));
+      }
+    }
+
+    // Soft delete
+    const deleteMatch = url.pathname.match(/^\/admin\/games\/(\d+)\/delete$/);
+    if (deleteMatch && request.method === "POST") {
+      await softDeleteGame(env, deleteMatch[1]);
+      return redirectResponse("/admin");
+    }
+
+    // Update stock
+    const stockMatch = url.pathname.match(/^\/admin\/games\/(\d+)\/stock$/);
+    if (stockMatch && request.method === "POST") {
+      const data = await parseFormData(request);
+      const newStock = Number(data.stock || 0);
+      await updateStock(env, stockMatch[1], newStock);
+      return redirectResponse("/admin");
+    }
+  }
+
+  // Public API list
+  if (url.pathname === "/games" && request.method === "GET") {
+    const filters = {
+      platform: url.searchParams.get("platform") || undefined,
+      region: url.searchParams.get("region") || undefined,
+      capacity: url.searchParams.get("capacity") || undefined,
+      is_plus: url.searchParams.get("is_plus") ? url.searchParams.get("is_plus") === "1" : undefined,
+    };
+    const games = await listPublicGames(env, filters);
+    return jsonResponse({ games });
+  }
+
+  // Storefront page
+  if (url.pathname === "/store" && request.method === "GET") {
+    const games = await listPublicGames(env);
+    return htmlResponse(renderStorefront(games));
+  }
+
+  // Game detail
+  const gameDetailMatch = url.pathname.match(/^\/game\/(\d+)$/);
+  if (gameDetailMatch && request.method === "GET") {
+    const game = await getGameById(env, gameDetailMatch[1]);
+    if (!game || !game.active) return null; // fall back to legacy 404
+    const enriched = {
+      ...game,
+      is_plus: Boolean(game.is_plus),
+      out_of_stock: Number(game.stock) <= 0,
+      seo_title: game.seo_title || game.title,
+      seo_description: game.seo_description || game.description || CONFIG.DEFAULT_META_DESCRIPTION,
+    };
+    return htmlResponse(renderGameDetail(enriched));
+  }
+
+  return null; // allow legacy router to respond
+}
+
 export default {
   async fetch(request, env, ctx) {
+    // NEW: attempt to serve admin/storefront/API routes first
+    try {
+      const advancedResponse = await handleRequest(request, env, ctx);
+      if (advancedResponse) {
+        return advancedResponse;
+      }
+    } catch (err) {
+      return new Response(`Internal error: ${err.message}`, { status: 500 });
+    }
+
     const url = new URL(request.url);
 
     // ============================================================
