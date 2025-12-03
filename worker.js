@@ -109,14 +109,6 @@ async function parseFormData(request) {
 // SECTION 1: DATABASE LAYER (D1 helpers)
 // ============================================================
 
-function getDb(env) {
-  const db = env.DB || env.games;
-  if (!db) {
-    throw new Error("D1 binding not configured; expected env.DB or env.games");
-  }
-  return db;
-}
-
 async function getAllGames(env, filters = {}) {
   const conditions = [];
   const params = [];
@@ -145,19 +137,19 @@ async function getAllGames(env, filters = {}) {
     params.push(`%${filters.title}%`);
   }
   const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
-  const stmt = getDb(env).prepare(`SELECT * FROM games ${where} ORDER BY id DESC`);
+  const stmt = env.DB.prepare(`SELECT * FROM games ${where} ORDER BY id DESC`);
   const result = await stmt.bind(...params).all();
   return result.results || [];
 }
 
 async function getGameById(env, id) {
-  const stmt = getDb(env).prepare("SELECT * FROM games WHERE id = ? LIMIT 1");
+  const stmt = env.DB.prepare("SELECT * FROM games WHERE id = ? LIMIT 1");
   const result = await stmt.bind(id).first();
   return result || null;
 }
 
 async function createGame(env, data) {
-  const stmt = getDb(env).prepare(`
+  const stmt = env.DB.prepare(`
     INSERT INTO games (
       title, platform, region, capacity, is_plus, price, stock, active,
       image_url, description, seo_title, seo_description, seo_tags
@@ -181,7 +173,7 @@ async function createGame(env, data) {
 }
 
 async function updateGame(env, id, data) {
-  const stmt = getDb(env).prepare(`
+  const stmt = env.DB.prepare(`
     UPDATE games SET
       title = ?, platform = ?, region = ?, capacity = ?, is_plus = ?, price = ?,
       stock = ?, active = ?, image_url = ?, description = ?, seo_title = ?,
@@ -207,12 +199,12 @@ async function updateGame(env, id, data) {
 }
 
 async function softDeleteGame(env, id) {
-  const stmt = getDb(env).prepare("UPDATE games SET active = 0 WHERE id = ?");
+  const stmt = env.DB.prepare("UPDATE games SET active = 0 WHERE id = ?");
   await stmt.bind(id).run();
 }
 
 async function updateStock(env, id, newStock) {
-  const stmt = getDb(env).prepare("UPDATE games SET stock = ? WHERE id = ?");
+  const stmt = env.DB.prepare("UPDATE games SET stock = ? WHERE id = ?");
   await stmt.bind(newStock, id).run();
 }
 
@@ -748,13 +740,9 @@ async function handleRequest(request, env, ctx) {
 export default {
   async fetch(request, env, ctx) {
     // NEW: attempt to serve admin/storefront/API routes first
-    try {
-      const advancedResponse = await handleRequest(request, env, ctx);
-      if (advancedResponse) {
-        return advancedResponse;
-      }
-    } catch (err) {
-      return new Response(`Internal error: ${err.message}`, { status: 500 });
+    const advancedResponse = await handleRequest(request, env, ctx);
+    if (advancedResponse) {
+      return advancedResponse;
     }
 
     const url = new URL(request.url);
