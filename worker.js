@@ -2199,15 +2199,16 @@ class InventoryManager {
 
             const { games = [] } = await response.json();
 
-            // Normalize payload to the UI schema (each variant is a purchasable item)
             const flattened = [];
             games.forEach((g) => {
                 const variants = g.variants && g.variants.length
                     ? g.variants
                     : [{ id: g.id, platform: g.platform, capacity: g.capacity, price: g.price, stock: g.stock }];
+
                 variants.forEach((v) => {
+                    const rawId = v.id || (g.id + '-' + v.platform + '-' + v.capacity);
                     flattened.push({
-                        id: Number(v.id || `${g.id}${v.platform}${v.capacity}`.replace(/\D/g, '')),
+                        id: Number(String(rawId).replace(/\D/g, '')),
                         gameId: Number(g.id),
                         title: g.title,
                         platform: v.platform,
@@ -2220,7 +2221,7 @@ class InventoryManager {
                         isPlusIncluded: Boolean(g.is_plus),
                         isFeatured: Boolean(g.is_plus),
                         desc: g.description || g.seo_description || CONFIG.DEFAULT_META_DESCRIPTION,
-                        variantLabel: `${v.platform} ظرفیت ${v.capacity}`,
+                        variantLabel: v.platform + ' ظرفیت ' + v.capacity,
                     });
                 });
             });
@@ -2417,41 +2418,40 @@ class UIManager {
     createGameCard(game) {
         const isLiked = this.inventory.wishlist.includes(game.id);
         const inStock = game.stock > 0;
-        const capacityLabel = `ظرفیت ${game.capacity}`;
-        
+        const capacityLabel = 'ظرفیت ' + game.capacity;
+
         const div = document.createElement('div');
         div.className = 'game-card';
-        div.innerHTML = \`
-            <div class="card-image-wrapper" onclick="window.app.ui.openProductModal(\${game.id})">
-                <img src="\${game.image}" alt="\${game.title}" class="card-img" loading="lazy">
-                <div class="card-overlay"></div>
-                <div class="card-badges">
-                    <span class="badge-item badge-stock \${inStock ? 'in' : 'out'}">
-                        \${inStock ? 'موجود: ' + game.stock : 'ناموجود'}
-                    </span>
-                    \${game.isPlusIncluded ? '<span class="badge-item badge-plus">+Plus</span>' : ''}
-                </div>
-            </div>
-            <div class="card-content">
-                <h4 class="card-title">\${game.title}</h4>
-                <div class="card-meta">
-                    <span><i class="fab fa-playstation"></i> \${game.platform}</span>
-                    <span><i class="fas fa-globe"></i> \${game.region}</span>
-                    <span>\${capacityLabel}</span>
-                </div>
-                <div class="card-footer">
-                    <span class="card-price">\${game.price.toLocaleString()}</span>
-                    <div class="card-actions">
-                        <button class="btn-icon btn-fav \${isLiked ? 'active' : ''}" onclick="window.app.inventory.toggleWishlist(\${game.id})">
-                            <i class="\${isLiked ? 'fas' : 'far'} fa-heart"></i>
-                        </button>
-                        <button class="btn-icon btn-cart" \${!inStock ? 'disabled style="opacity:0.5"' : ''} onclick="window.app.inventory.addToCart(\${game.id}, 'game')">
-                            <i class="fas fa-plus"></i>
-                        </button>
-                    </div>
-                </div>
-            </div>
-        \`;
+        div.innerHTML =
+            '<div class="card-image-wrapper" onclick="window.app.ui.openProductModal(' + game.id + ')">' +
+                '<img src="' + game.image + '" alt="' + game.title + '" class="card-img" loading="lazy">' +
+                '<div class="card-overlay"></div>' +
+                '<div class="card-badges">' +
+                    '<span class="badge-item badge-stock ' + (inStock ? 'in' : 'out') + '">' +
+                        (inStock ? 'موجود: ' + game.stock : 'ناموجود') +
+                    '</span>' +
+                    (game.isPlusIncluded ? '<span class="badge-item badge-plus">+Plus</span>' : '') +
+                '</div>' +
+            '</div>' +
+            '<div class="card-content">' +
+                '<h4 class="card-title">' + game.title + '</h4>' +
+                '<div class="card-meta">' +
+                    '<span><i class="fab fa-playstation"></i> ' + game.platform + '</span>' +
+                    '<span><i class="fas fa-globe"></i> ' + game.region + '</span>' +
+                    '<span>' + capacityLabel + '</span>' +
+                '</div>' +
+                '<div class="card-footer">' +
+                    '<span class="card-price">' + game.price.toLocaleString() + '</span>' +
+                    '<div class="card-actions">' +
+                        '<button class="btn-icon btn-fav ' + (isLiked ? 'active' : '') + '" onclick="window.app.inventory.toggleWishlist(' + game.id + ')">' +
+                            '<i class="' + (isLiked ? 'fas' : 'far') + ' fa-heart"></i>' +
+                        '</button>' +
+                        '<button class="btn-icon btn-cart" ' + (!inStock ? 'disabled style="opacity:0.5"' : '') + ' onclick="window.app.inventory.addToCart(' + game.id + ', \"game\")">' +
+                            '<i class="fas fa-plus"></i>' +
+                        '</button>' +
+                    '</div>' +
+                '</div>' +
+            '</div>';
         return div;
     }
 
@@ -2476,20 +2476,19 @@ class UIManager {
 
     renderSearchResults(results) {
         this.elems.searchResults.innerHTML = '';
-        
+
         if (results.length > 0) {
             this.elems.searchResults.classList.add('active');
             results.forEach(item => {
-                const variantLabel = item.variantLabel || `${item.platform} | ظرفیت ${item.capacity}`;
+                const variantLabel = item.variantLabel || item.platform + ' | ظرفیت ' + item.capacity;
                 const div = document.createElement('div');
                 div.className = 'search-item';
-                div.innerHTML = \`
-                    <img src="\${item.image}" alt="">
-                    <div>
-                        <div style="font-weight:bold">\${item.title}</div>
-                        <div style="font-size:0.8rem;color:#aaa">\${variantLabel} | \${item.price.toLocaleString()}</div>
-                    </div>
-                \`;
+                div.innerHTML =
+                    '<img src="' + item.image + '" alt="">' +
+                    '<div>' +
+                        '<div style="font-weight:bold">' + item.title + '</div>' +
+                        '<div style="font-size:0.8rem;color:#aaa">' + variantLabel + ' | ' + item.price.toLocaleString() + '</div>' +
+                    '</div>';
                 div.onclick = () => {
                     this.openProductModal(item.id);
                     this.elems.searchResults.classList.remove('active');
@@ -2598,24 +2597,24 @@ class UIManager {
         const item = (this.inventory?.games || []).find(g => g.id === id);
         if(!item) return;
 
-        this.elems.modalDetails.innerHTML = \`
-            <img src="\${item.image}" class="modal-hero">
-            <div class="modal-info">
-                <h2 class="modal-title">\${item.title}</h2>
-                <div class="modal-tags">
-                    <span class="tag">\${item.platform}</span>
-                    <span class="tag">Region \${item.region}</span>
-                    <span class="tag">\${item.variantLabel || `Capacity ${item.capacity}`}</span>
-                </div>
-                <p class="modal-desc">\${item.desc}</p>
-                <div class="modal-price-box">
-                    <span style="font-size:1.5rem;font-weight:bold;color:#00f3ff">\${item.price.toLocaleString()} تومان</span>
-                    <button class="btn-primary" onclick="window.app.inventory.addToCart(\${item.id}, 'game');window.app.ui.closeModal()">
-                        <i class="fas fa-shopping-cart"></i> خرید کنید
-                    </button>
-                </div>
-            </div>
-        \`;
+        const modalCapacity = item.variantLabel || ('Capacity ' + item.capacity);
+        this.elems.modalDetails.innerHTML =
+            '<img src="' + item.image + '" class="modal-hero">' +
+            '<div class="modal-info">' +
+                '<h2 class="modal-title">' + item.title + '</h2>' +
+                '<div class="modal-tags">' +
+                    '<span class="tag">' + item.platform + '</span>' +
+                    '<span class="tag">Region ' + item.region + '</span>' +
+                    '<span class="tag">' + modalCapacity + '</span>' +
+                '</div>' +
+                '<p class="modal-desc">' + item.desc + '</p>' +
+                '<div class="modal-price-box">' +
+                    '<span style="font-size:1.5rem;font-weight:bold;color:#00f3ff">' + item.price.toLocaleString() + ' تومان</span>' +
+                    '<button class="btn-primary" onclick="window.app.inventory.addToCart(' + item.id + ', \"game\");window.app.ui.closeModal()">' +
+                        '<i class="fas fa-shopping-cart"></i> خرید کنید' +
+                    '</button>' +
+                '</div>' +
+            '</div>';
         this.elems.productModal.style.display = 'flex';
     }
 
