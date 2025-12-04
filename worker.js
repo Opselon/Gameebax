@@ -25,6 +25,15 @@ const CONFIG = {
   DEFAULT_META_DESCRIPTION: "فروش ویژه بازی‌ها و اکانت‌های PS4/PS5 با تحویل فوری و ضمانت.",
 };
 
+const PLATFORM_CAPACITY_MATRIX = [
+  { platform: "PS4", capacity: 1 },
+  { platform: "PS4", capacity: 2 },
+  { platform: "PS4", capacity: 3 },
+  { platform: "PS5", capacity: 1 },
+  { platform: "PS5", capacity: 2 },
+  { platform: "PS5", capacity: 3 },
+];
+
 // Example wrangler.toml binding for D1 (comment only, keep env.DB)
 // [[d1_databases]]
 // binding = "DB"
@@ -119,17 +128,10 @@ async function parseFormData(request) {
 async function getAllGames(env, filters = {}) {
   const conditions = [];
   const params = [];
-  if (filters.platform) {
-    conditions.push("platform = ?");
-    params.push(filters.platform);
-  }
+
   if (filters.region) {
     conditions.push("region = ?");
     params.push(filters.region);
-  }
-  if (filters.capacity) {
-    conditions.push("capacity = ?");
-    params.push(filters.capacity);
   }
   if (filters.is_plus !== undefined) {
     conditions.push("is_plus = ?");
@@ -143,10 +145,80 @@ async function getAllGames(env, filters = {}) {
     conditions.push("title LIKE ?");
     params.push(`%${filters.title}%`);
   }
+  if (filters.platform) {
+    conditions.push(
+      "EXISTS (SELECT 1 FROM game_variants gv WHERE gv.game_id = games.id AND gv.platform = ?" +
+        (filters.includeInactiveVariants ? ")" : " AND gv.is_active = 1)")
+    );
+    params.push(filters.platform);
+  }
+  if (filters.capacity) {
+    conditions.push(
+      "EXISTS (SELECT 1 FROM game_variants gv WHERE gv.game_id = games.id AND gv.capacity = ?" +
+        (filters.includeInactiveVariants ? ")" : " AND gv.is_active = 1)")
+    );
+    params.push(filters.capacity);
+  }
+
   const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
   const stmt = env.DB.prepare(`SELECT * FROM games ${where} ORDER BY id DESC`);
   const result = await stmt.bind(...params).all();
   return result.results || [];
+}
+
+async function getVariantsForGames(env, gameIds, { includeInactive = false } = {}) {
+  if (!gameIds || gameIds.length === 0) return {};
+  const placeholders = gameIds.map(() => "?").join(",");
+  const activeClause = includeInactive ? "" : "AND is_active = 1";
+  const stmt = env.DB.prepare(
+    `SELECT * FROM game_variants WHERE game_id IN (${placeholders}) ${activeClause} ORDER BY platform, capacity`
+  );
+  const result = await stmt.bind(...gameIds).all();
+  const map = {};
+  for (const row of result.results || []) {
+    map[row.game_id] = map[row.game_id] || [];
+    map[row.game_id].push(row);
+  }
+  return map;
+}
+
+async function upsertGameVariant(env, variant) {
+  const stmt = env.DB.prepare(`
+    INSERT INTO game_variants (game_id, platform, capacity, price, old_price, stock, is_active)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(game_id, platform, capacity) DO UPDATE SET
+      price = excluded.price,
+      old_price = excluded.old_price,
+      stock = excluded.stock,
+      is_active = excluded.is_active
+  `);
+  await stmt
+    .bind(
+      variant.game_id,
+      variant.platform,
+      variant.capacity,
+      variant.price,
+      variant.old_price || null,
+      variant.stock ?? 0,
+      variant.is_active ? 1 : 0
+    )
+    .run();
+}
+
+async function upsertGameVariantsBatch(env, variants = []) {
+  if (!variants.length) return;
+  const statement = (v) =>
+    env.DB.prepare(`
+      INSERT INTO game_variants (game_id, platform, capacity, price, old_price, stock, is_active)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(game_id, platform, capacity) DO UPDATE SET
+        price = excluded.price,
+        old_price = excluded.old_price,
+        stock = excluded.stock,
+        is_active = excluded.is_active
+    `).bind(v.game_id, v.platform, v.capacity, v.price, v.old_price || null, v.stock ?? 0, v.is_active ? 1 : 0);
+
+  await env.DB.batch(variants.map(statement));
 }
 
 async function getGameById(env, id) {
@@ -155,21 +227,26 @@ async function getGameById(env, id) {
   return result || null;
 }
 
-async function createGame(env, data) {
+async function createGame(env, payload) {
+  const data = payload.game || payload;
+  const variants = payload.variants || [];
+  const summary = summarizeVariants(variants);
+  const anchorVariant = summary.cheapest || variants[0] || { platform: data.platform || "PS4", capacity: 1, price: 0 };
+  const totalStock = summary.totalStock ?? data.stock ?? 0;
   const stmt = env.DB.prepare(`
     INSERT INTO games (
       title, platform, region, capacity, is_plus, price, stock, active,
       image_url, description, seo_title, seo_description, seo_tags
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
-  await stmt.bind(
+  const result = await stmt.bind(
     data.title,
-    data.platform,
+    data.platform || anchorVariant.platform,
     data.region,
-    data.capacity,
+    data.capacity ?? anchorVariant.capacity,
     data.is_plus ? 1 : 0,
-    data.price,
-    data.stock,
+    data.price ?? anchorVariant.price,
+    totalStock,
     data.active ? 1 : 0,
     data.image_url || null,
     data.description || null,
@@ -177,9 +254,18 @@ async function createGame(env, data) {
     data.seo_description || null,
     data.seo_tags || null,
   ).run();
+  const gameId = result.meta?.last_row_id;
+  if (gameId) {
+    await upsertGameVariantsBatch(env, variants.map((v) => ({ ...v, game_id: gameId })));
+  }
 }
 
-async function updateGame(env, id, data) {
+async function updateGame(env, id, payload) {
+  const data = payload.game || payload;
+  const variants = payload.variants || [];
+  const summary = summarizeVariants(variants);
+  const anchorVariant = summary.cheapest || variants[0] || { platform: data.platform || "PS4", capacity: 1, price: 0 };
+  const totalStock = summary.totalStock ?? data.stock ?? 0;
   const stmt = env.DB.prepare(`
     UPDATE games SET
       title = ?, platform = ?, region = ?, capacity = ?, is_plus = ?, price = ?,
@@ -189,12 +275,12 @@ async function updateGame(env, id, data) {
   `);
   await stmt.bind(
     data.title,
-    data.platform,
+    data.platform || anchorVariant.platform,
     data.region,
-    data.capacity,
+    data.capacity ?? anchorVariant.capacity,
     data.is_plus ? 1 : 0,
-    data.price,
-    data.stock,
+    data.price ?? anchorVariant.price,
+    totalStock,
     data.active ? 1 : 0,
     data.image_url || null,
     data.description || null,
@@ -203,6 +289,7 @@ async function updateGame(env, id, data) {
     data.seo_tags || null,
     id,
   ).run();
+  await upsertGameVariantsBatch(env, variants.map((v) => ({ ...v, game_id: Number(id) })));
 }
 
 async function softDeleteGame(env, id) {
@@ -226,48 +313,59 @@ async function hardDeleteGame(env, id) {
 }
 
 async function getDashboardSummary(env) {
-  const aggregate =
+  const gameAggregate =
     (await env.DB.prepare(
       `SELECT
         COUNT(*) AS total_games,
         SUM(CASE WHEN active = 1 THEN 1 ELSE 0 END) AS active_games,
         SUM(CASE WHEN active = 0 THEN 1 ELSE 0 END) AS inactive_games,
-        SUM(CASE WHEN is_plus = 1 THEN 1 ELSE 0 END) AS plus_games,
+        SUM(CASE WHEN is_plus = 1 THEN 1 ELSE 0 END) AS plus_games
+      FROM games`
+    ).first()) || {};
+
+  const variantAggregate =
+    (await env.DB.prepare(
+      `SELECT
         SUM(stock) AS total_stock,
         SUM(price * stock) AS inventory_value,
         SUM(CASE WHEN stock <= 3 THEN 1 ELSE 0 END) AS low_stock_games,
         MIN(price) AS min_price,
         MAX(price) AS max_price,
         ROUND(AVG(price), 0) AS avg_price
-      FROM games`
+      FROM game_variants
+      WHERE is_active = 1`
     ).first()) || {};
 
   const recent = await env.DB.prepare(
-    "SELECT id, title, platform, price, stock, active FROM games ORDER BY id DESC LIMIT 6"
+    `SELECT g.id, g.title, MIN(gv.price) AS price, SUM(gv.stock) AS stock, g.active
+     FROM games g
+     LEFT JOIN game_variants gv ON gv.game_id = g.id AND gv.is_active = 1
+     GROUP BY g.id
+     ORDER BY g.id DESC
+     LIMIT 6`
   ).all();
 
   const platformBreakdown = await env.DB.prepare(
     `SELECT
       platform,
       COUNT(*) AS total,
-      SUM(CASE WHEN active = 1 THEN 1 ELSE 0 END) AS active,
-      SUM(stock) AS stock,
-      SUM(CASE WHEN is_plus = 1 THEN 1 ELSE 0 END) AS plus
-    FROM games
+      SUM(CASE WHEN is_active = 1 THEN 1 ELSE 0 END) AS active,
+      SUM(stock) AS stock
+    FROM game_variants
     GROUP BY platform`
   ).all();
 
   return {
-    total_games: aggregate.total_games || 0,
-    active_games: aggregate.active_games || 0,
-    inactive_games: aggregate.inactive_games || 0,
-    plus_games: aggregate.plus_games || 0,
-    total_stock: aggregate.total_stock || 0,
-    inventory_value: aggregate.inventory_value || 0,
-    low_stock_games: aggregate.low_stock_games || 0,
-    min_price: aggregate.min_price || 0,
-    max_price: aggregate.max_price || 0,
-    avg_price: aggregate.avg_price || 0,
+    total_games: gameAggregate.total_games || 0,
+    active_games: gameAggregate.active_games || 0,
+    inactive_games: gameAggregate.inactive_games || 0,
+    plus_games: gameAggregate.plus_games || 0,
+    total_stock: variantAggregate.total_stock || 0,
+    inventory_value: variantAggregate.inventory_value || 0,
+    low_stock_games: variantAggregate.low_stock_games || 0,
+    min_price: variantAggregate.min_price || 0,
+    max_price: variantAggregate.max_price || 0,
+    avg_price: variantAggregate.avg_price || 0,
     recent_games: recent.results || [],
     platform_breakdown: platformBreakdown.results || [],
   };
@@ -278,45 +376,107 @@ async function getDashboardSummary(env) {
 // ============================================================
 
 function normalizeGamePayload(data) {
-  const requiredFields = ["title", "platform", "region", "capacity", "price", "stock"];
-  for (const field of requiredFields) {
-    if (!data[field]) throw new Error(`Missing required field: ${field}`);
-  }
-  const capacityNumber = Number(data.capacity);
-  const priceNumber = Number(data.price);
-  const stockNumber = Number(data.stock);
+  if (!data.title) throw new Error("Missing required field: title");
+  if (!data.region) throw new Error("Missing required field: region");
+
+  const variants = PLATFORM_CAPACITY_MATRIX.map(({ platform, capacity }) => {
+    const price = Number(data[`variant_price_${platform}_${capacity}`]);
+    const stock = Number(data[`variant_stock_${platform}_${capacity}`]);
+    const is_active = parseBoolean(data[`variant_active_${platform}_${capacity}`] ?? true);
+    return {
+      platform,
+      capacity,
+      price: Number.isNaN(price) ? 0 : price,
+      old_price: null,
+      stock: Number.isNaN(stock) ? 0 : stock,
+      is_active,
+    };
+  });
+
+  const summary = summarizeVariants(variants);
+  const anchorVariant = summary.cheapest || variants[0];
+  const totalStock = summary.totalStock || 0;
+
   return {
-    title: data.title,
-    platform: data.platform,
-    region: data.region,
-    capacity: Number.isNaN(capacityNumber) ? 0 : capacityNumber,
-    is_plus: parseBoolean(data.is_plus),
-    price: Number.isNaN(priceNumber) ? 0 : priceNumber,
-    stock: Number.isNaN(stockNumber) ? 0 : stockNumber,
-    active: parseBoolean(data.active ?? true),
-    image_url: data.image_url || "",
-    description: data.description || "",
-    seo_title: data.seo_title || data.title,
-    seo_description: data.seo_description || data.description || CONFIG.DEFAULT_META_DESCRIPTION,
-    seo_tags: data.seo_tags || "",
+    game: {
+      title: data.title,
+      platform: anchorVariant.platform,
+      region: data.region,
+      capacity: anchorVariant.capacity,
+      is_plus: parseBoolean(data.is_plus),
+      price: anchorVariant.price,
+      old_price: null,
+      stock: totalStock,
+      active: parseBoolean(data.active ?? true),
+      image_url: data.image_url || "",
+      description: data.description || "",
+      seo_title: data.seo_title || data.title,
+      seo_description: data.seo_description || data.description || CONFIG.DEFAULT_META_DESCRIPTION,
+      seo_tags: data.seo_tags || "",
+    },
+    variants,
   };
+}
+
+function summarizeVariants(variants = []) {
+  if (!variants.length) {
+    return { totalStock: 0, cheapest: null };
+  }
+  const active = variants.filter((v) => parseBoolean(v.is_active) !== false);
+  const pool = active.length ? active : variants;
+  let cheapest = pool[0];
+  let totalStock = 0;
+  for (const v of pool) {
+    if (v.price < cheapest.price) cheapest = v;
+    totalStock += Number(v.stock || 0);
+  }
+  return { totalStock, cheapest };
 }
 
 async function listPublicGames(env, filters = {}) {
   const games = await getAllGames(env, { ...filters, active: true });
-  return games.map((g) => ({
-    ...g,
-    is_plus: Boolean(g.is_plus),
-    out_of_stock: Number(g.stock) <= 0,
-    display_price: formatPrice(g.price),
-    seo_title: g.seo_title || g.title,
-    seo_description: g.seo_description || g.description || CONFIG.DEFAULT_META_DESCRIPTION,
-  }));
+  const variantsMap = await getVariantsForGames(env, games.map((g) => g.id));
+  return games.map((g) => {
+    const variants = (variantsMap[g.id] || []).map((v) => ({ ...v, is_active: Boolean(v.is_active) }));
+    const summary = summarizeVariants(variants);
+    const cheapestPrice = summary.cheapest?.price ?? g.price ?? 0;
+    const cheapestPlatform = summary.cheapest?.platform ?? g.platform;
+    const cheapestCapacity = summary.cheapest?.capacity ?? g.capacity;
+    const totalStock = summary.totalStock || g.stock || 0;
+    return {
+      ...g,
+      platform: cheapestPlatform,
+      capacity: cheapestCapacity,
+      price: cheapestPrice,
+      stock: totalStock,
+      variants: variants.filter((v) => v.is_active),
+      is_plus: Boolean(g.is_plus),
+      out_of_stock: Number(totalStock) <= 0,
+      display_price: formatPrice(cheapestPrice),
+      seo_title: g.seo_title || g.title,
+      seo_description: g.seo_description || g.description || CONFIG.DEFAULT_META_DESCRIPTION,
+    };
+  });
 }
 
 async function listAdminGames(env, filters = {}) {
   const games = await getAllGames(env, filters);
-  return games.map((g) => ({ ...g, is_plus: Boolean(g.is_plus) }));
+  const variantsMap = await getVariantsForGames(env, games.map((g) => g.id), {
+    includeInactive: true,
+  });
+  return games.map((g) => {
+    const variants = variantsMap[g.id] || [];
+    const summary = summarizeVariants(variants);
+    const cheapestPrice = summary.cheapest?.price ?? g.price ?? 0;
+    const totalStock = summary.totalStock || g.stock || 0;
+    return {
+      ...g,
+      price: cheapestPrice,
+      stock: totalStock,
+      variants,
+      is_plus: Boolean(g.is_plus),
+    };
+  });
 }
 
 async function createGameFromForm(env, request) {
@@ -388,10 +548,17 @@ function renderLayout(content, { title = "GalaxyZone Admin", metaDescription = C
       .btn-danger { background:var(--danger); box-shadow:0 5px 20px rgba(239,83,80,0.35); }
       .btn-ghost { background:transparent; color:#fff; border:1px solid #6be1ff; }
       form { margin-top:12px; }
-      label { display:block; margin-top:8px; font-weight:700; }
-      input, select, textarea { width:100%; padding:10px; margin-top:6px; border-radius:10px; border:1px solid #2a335e; background:#0f142d; color:#fff; }
+      label { display:flex; flex-direction:column; align-items:flex-start; gap:6px; margin-top:8px; font-weight:700; }
+      input, select, textarea { width:100%; padding:10px; border-radius:10px; border:1px solid #2a335e; background:#0f142d; color:#fff; }
       textarea { min-height:80px; }
       .grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(240px, 1fr)); gap:12px; }
+      .form-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(260px, 1fr)); gap:14px; align-items:start; }
+      .form-card { background:var(--card); border:1px solid var(--border); border-radius:14px; padding:14px; box-shadow:0 10px 30px rgba(0,0,0,0.25); }
+      .form-card h3 { margin:0 0 10px 0; }
+      .variant-matrix { display:grid; grid-template-columns:repeat(auto-fit, minmax(260px, 1fr)); gap:12px; }
+      .variant-row { border:1px dashed var(--border); border-radius:12px; padding:10px; background:#0d112a; display:grid; gap:10px; grid-template-columns:repeat(auto-fit, minmax(120px, 1fr)); }
+      .variant-row__title { grid-column:1/-1; display:flex; justify-content:space-between; align-items:center; font-weight:800; }
+      .full-width { grid-column:1/-1; }
       .badge { display:inline-block; padding:2px 8px; border-radius:8px; background:#2e7d32; color:#fff; font-size:12px; }
       .badge-ghost { background:rgba(255,255,255,0.06); color:#cfd8ff; border:1px dashed var(--border); }
       .plus { background:#c2185b; }
@@ -465,55 +632,60 @@ function renderAdminLoginPage(errorMessage = "") {
 function renderAdminDashboard(games, filters = {}, summary = {}) {
   const rows = games
     .map(
-      (g) => `<tr>
-        <td>${g.id}</td>
-        <td>${g.title}</td>
-        <td>${g.platform}</td>
-        <td>${g.region}</td>
-        <td>${g.capacity}</td>
-        <td>${g.is_plus ? '<span class="badge plus">+Plus</span>' : ''}</td>
-        <td>${formatPrice(g.price)}</td>
-        <td>
-          <form method="POST" action="/admin/games/${g.id}/stock" style="display:flex; gap:6px; align-items:center;">
-            <input type="number" name="stock" value="${g.stock}" style="width:90px;" />
-            <button class="btn btn-secondary" type="submit">بروزرسانی</button>
-          </form>
-        </td>
-        <td>${g.active ? '<span class="badge">فعال</span>' : '<span class="badge" style="background:#c62828;">غیرفعال</span>'}</td>
-        <td>${g.image_url ? '<a href="' + g.image_url + '" target="_blank">لینک</a>' : '-'}</td>
-        <td>${truncate(g.description, 50)}</td>
-        <td>${g.seo_title || '-'}</td>
-        <td>${truncate(g.seo_description, 60)}</td>
-        <td>${g.seo_tags || '-'}</td>
-        <td>
-          <a class="btn btn-secondary" href="/admin/games/${g.id}">ویرایش</a>
-          <form method="POST" action="/admin/games/${g.id}/delete" style="display:inline;" onsubmit="return confirm('بازی غیرفعال می‌شود. ادامه می‌دهید؟');">
-            <button class="btn btn-danger" type="submit">حذف نرم</button>
-          </form>
-          ${!g.active ? `<form method="POST" action="/admin/games/${g.id}/restore" style="display:inline;">
-            <button class="btn" type="submit">بازگردانی</button>
-          </form>` : ''}
-          <form method="POST" action="/admin/games/${g.id}" style="display:inline;">
-            <input type="hidden" name="title" value="${g.title}" />
-            <input type="hidden" name="platform" value="${g.platform}" />
-            <input type="hidden" name="region" value="${g.region}" />
-            <input type="hidden" name="capacity" value="${g.capacity}" />
-            <input type="hidden" name="is_plus" value="${g.is_plus ? 1 : 0}" />
-            <input type="hidden" name="price" value="${g.price}" />
-            <input type="hidden" name="stock" value="${g.stock}" />
-            <input type="hidden" name="active" value="${g.active ? 0 : 1}" />
-            <input type="hidden" name="image_url" value="${g.image_url || ''}" />
-            <input type="hidden" name="description" value="${g.description || ''}" />
-            <input type="hidden" name="seo_title" value="${g.seo_title || ''}" />
-            <input type="hidden" name="seo_description" value="${g.seo_description || ''}" />
-            <input type="hidden" name="seo_tags" value="${g.seo_tags || ''}" />
-            <button class="btn" type="submit">${g.active ? 'Deactivate' : 'Activate'}</button>
-          </form>
-          <form method="POST" action="/admin/games/${g.id}/purge" style="display:inline;" onsubmit="return confirm('حذف دائمی و غیرقابل بازگشت است. مطمئن هستید؟');">
-            <button class="btn btn-danger" type="submit">حذف دائمی</button>
-          </form>
-        </td>
-      </tr>`
+      (g) => {
+        const variantDetails = (g.variants || [])
+          .map(
+            (v) => `<div class="chip">
+              ${v.platform.toUpperCase()} | ظرفیت ${v.capacity} | ${formatPrice(v.price)} تومان
+              <span class="muted">موجودی: ${v.stock}</span>
+              ${!v.is_active ? '<span class="badge-ghost">غیرفعال</span>' : ''}
+            </div>`
+          )
+          .join("") || "-";
+        return `<tr>
+          <td>${g.id}</td>
+          <td>${g.title}</td>
+          <td>${g.region}</td>
+          <td>${g.is_plus ? '<span class="badge plus">+Plus</span>' : '-'}</td>
+          <td>${variantDetails}</td>
+          <td>${formatPrice(g.price)}</td>
+          <td>${g.stock}</td>
+          <td>${g.active ? '<span class="badge">فعال</span>' : '<span class="badge" style="background:#c62828;">غیرفعال</span>'}</td>
+          <td>${g.image_url ? '<a href="' + g.image_url + '" target="_blank">لینک</a>' : '-'}</td>
+          <td>${truncate(g.description, 50)}</td>
+          <td>${g.seo_title || '-'}</td>
+          <td>${truncate(g.seo_description, 60)}</td>
+          <td>${g.seo_tags || '-'}</td>
+          <td>
+            <a class="btn btn-secondary" href="/admin/games/${g.id}">ویرایش</a>
+            <form method="POST" action="/admin/games/${g.id}/delete" style="display:inline;" onsubmit="return confirm('بازی غیرفعال می‌شود. ادامه می‌دهید؟');">
+              <button class="btn btn-danger" type="submit">حذف نرم</button>
+            </form>
+            ${!g.active ? `<form method="POST" action="/admin/games/${g.id}/restore" style="display:inline;">
+              <button class="btn" type="submit">بازگردانی</button>
+            </form>` : ''}
+            <form method="POST" action="/admin/games/${g.id}" style="display:inline;">
+              <input type="hidden" name="title" value="${g.title}" />
+              <input type="hidden" name="platform" value="${g.platform || ''}" />
+              <input type="hidden" name="region" value="${g.region || ''}" />
+              <input type="hidden" name="capacity" value="${g.capacity || 0}" />
+              <input type="hidden" name="is_plus" value="${g.is_plus ? 1 : 0}" />
+              <input type="hidden" name="price" value="${g.price}" />
+              <input type="hidden" name="stock" value="${g.stock}" />
+              <input type="hidden" name="active" value="${g.active ? 0 : 1}" />
+              <input type="hidden" name="image_url" value="${g.image_url || ''}" />
+              <input type="hidden" name="description" value="${g.description || ''}" />
+              <input type="hidden" name="seo_title" value="${g.seo_title || ''}" />
+              <input type="hidden" name="seo_description" value="${g.seo_description || ''}" />
+              <input type="hidden" name="seo_tags" value="${g.seo_tags || ''}" />
+              <button class="btn" type="submit">${g.active ? 'Deactivate' : 'Activate'}</button>
+            </form>
+            <form method="POST" action="/admin/games/${g.id}/purge" style="display:inline;" onsubmit="return confirm('حذف دائمی و غیرقابل بازگشت است. مطمئن هستید؟');">
+              <button class="btn btn-danger" type="submit">حذف دائمی</button>
+            </form>
+          </td>
+        </tr>`;
+      }
     )
     .join("");
 
@@ -603,7 +775,7 @@ function renderAdminDashboard(games, filters = {}, summary = {}) {
                 <strong>${item.title}</strong>
                 ${item.active ? '<span class="badge">فعال</span>' : '<span class="badge plus">معلق</span>'}
               </div>
-              <div class="muted">${item.platform} | ${formatPrice(item.price)} | ${item.stock} موجودی</div>
+              <div class="muted">${formatPrice(item.price)} | ${item.stock || 0} موجودی</div>
             </div>`
           )
           .join("")}
@@ -643,7 +815,7 @@ function renderAdminDashboard(games, filters = {}, summary = {}) {
       <table>
         <thead>
           <tr>
-            <th>ID</th><th>عنوان</th><th>پلتفرم</th><th>ریجن</th><th>ظرفیت</th><th>Plus</th><th>قیمت</th><th>موجودی</th><th>فعال</th><th>تصویر</th><th>توضیح</th><th>SEO Title</th><th>SEO Description</th><th>SEO Tags</th><th>اقدام</th>
+            <th>ID</th><th>عنوان</th><th>ریجن</th><th>Plus</th><th>واریانت‌ها</th><th>قیمت پایه</th><th>موجودی کل</th><th>فعال</th><th>تصویر</th><th>توضیح</th><th>SEO Title</th><th>SEO Description</th><th>SEO Tags</th><th>اقدام</th>
           </tr>
         </thead>
         <tbody>${rows}</tbody>
@@ -653,58 +825,79 @@ function renderAdminDashboard(games, filters = {}, summary = {}) {
   return renderLayout(content, { title: "Admin | Games" });
 }
 
-function renderAdminGameForm(game = null) {
+function renderAdminGameForm(game = null, variants = []) {
   const isEdit = Boolean(game);
   const action = isEdit ? `/admin/games/${game.id}` : "/admin/games";
+  const existingVariants = {};
+  (variants || []).forEach((v) => {
+    existingVariants[`${v.platform?.toUpperCase?.() || v.platform}_${v.capacity}`] = v;
+  });
+
+  const variantRows = PLATFORM_CAPACITY_MATRIX.map(({ platform, capacity }) => {
+    const key = `${platform}_${capacity}`;
+    const v = existingVariants[key] || {};
+    const activeChecked = v.is_active === undefined ? true : Boolean(v.is_active);
+    return `<div class="variant-row">
+      <div class="variant-row__title">
+        <span>${platform} | ظرفیت ${capacity}</span>
+        <label style="margin-top:0;">
+          <input type="hidden" name="variant_active_${platform}_${capacity}" value="0" />
+          <input type="checkbox" name="variant_active_${platform}_${capacity}" ${activeChecked ? "checked" : ""} /> فعال
+        </label>
+      </div>
+      <label>قیمت (تومان)
+        <input required type="number" min="0" name="variant_price_${platform}_${capacity}" value="${v.price ?? ""}" />
+      </label>
+      <label>موجودی
+        <input type="number" min="0" name="variant_stock_${platform}_${capacity}" value="${v.stock ?? ""}" />
+      </label>
+    </div>`;
+  }).join("");
+
   return renderLayout(`
     <h2>${isEdit ? "ویرایش بازی" : "ایجاد بازی"}</h2>
     <form method="POST" action="${action}">
-      <div class="grid">
-        <label>عنوان
-          <input required name="title" value="${game?.title || ""}" />
-        </label>
-        <label>پلتفرم
-          <select name="platform" required>
-            <option value="PS4" ${game?.platform === "PS4" ? "selected" : ""}>PS4</option>
-            <option value="PS5" ${game?.platform === "PS5" ? "selected" : ""}>PS5</option>
-          </select>
-        </label>
-        <label>ریجن
-          <input required name="region" value="${game?.region || ""}" />
-        </label>
-        <label>ظرفیت
-          <input required type="number" name="capacity" value="${game?.capacity || 2}" />
-        </label>
-        <label>+Plus
-          <input type="checkbox" name="is_plus" ${game?.is_plus ? "checked" : ""} />
-        </label>
-        <label>قیمت
-          <input required type="number" name="price" value="${game?.price || 0}" />
-        </label>
-        <label>موجودی
-          <input required type="number" name="stock" value="${game?.stock || 0}" />
-        </label>
-        <label>فعال
-          <input type="checkbox" name="active" ${game?.active ? "checked" : ""} />
-        </label>
-        <label>لینک تصویر
-          <input name="image_url" value="${game?.image_url || ""}" />
-        </label>
-        <label>SEO Title
-          <input name="seo_title" value="${game?.seo_title || ""}" />
-        </label>
-        <label>SEO Description
-          <textarea name="seo_description">${game?.seo_description || ""}</textarea>
-        </label>
-        <label>SEO Tags (comma-separated)
-          <input name="seo_tags" value="${game?.seo_tags || ""}" />
-        </label>
+      <div class="form-card">
+        <h3>اطلاعات کلی</h3>
+        <div class="form-grid">
+          <label>عنوان
+            <input required name="title" value="${game?.title || ""}" />
+          </label>
+          <label>ریجن
+            <input required name="region" value="${game?.region || ""}" />
+          </label>
+          <label>+Plus
+            <input type="checkbox" name="is_plus" ${game?.is_plus ? "checked" : ""} />
+          </label>
+          <label>فعال
+            <input type="checkbox" name="active" ${game?.active ?? true ? "checked" : ""} />
+          </label>
+          <label>لینک تصویر
+            <input name="image_url" value="${game?.image_url || ""}" />
+          </label>
+          <label>SEO Title
+            <input name="seo_title" value="${game?.seo_title || ""}" />
+          </label>
+          <label>SEO Tags (comma-separated)
+            <input name="seo_tags" value="${game?.seo_tags || ""}" />
+          </label>
+          <label class="full-width">SEO Description
+            <textarea name="seo_description">${game?.seo_description || ""}</textarea>
+          </label>
+          <label class="full-width">توضیح کامل
+            <textarea name="description">${game?.description || ""}</textarea>
+          </label>
+        </div>
       </div>
-      <label>توضیح کامل
-        <textarea name="description">${game?.description || ""}</textarea>
-      </label>
-      <button class="btn" type="submit">${isEdit ? "ثبت تغییرات" : "ایجاد"}</button>
-      <a class="btn btn-secondary" href="/admin">بازگشت</a>
+      <div class="form-card">
+        <h3>ماتریس قیمت‌گذاری</h3>
+        <p class="muted">برای هر پلتفرم (PS4/PS5) و ظرفیت (۱،۲،۳) قیمت، موجودی و وضعیت فعال را یکجا وارد کنید.</p>
+        <div class="variant-matrix">${variantRows}</div>
+      </div>
+      <div style="display:flex; gap:10px; margin-top:14px; flex-wrap:wrap;">
+        <button class="btn" type="submit">${isEdit ? "ثبت تغییرات" : "ایجاد"}</button>
+        <a class="btn btn-secondary" href="/admin">بازگشت</a>
+      </div>
     </form>
   `, { title: isEdit ? `Edit ${game.title}` : "Create Game" });
 }
@@ -712,17 +905,23 @@ function renderAdminGameForm(game = null) {
 function renderStorefront(games) {
   const cards = games
     .map(
-      (g) => `<article style="background:#0f132b; border:1px solid #1f2a55; padding:12px; border-radius:12px;">
-        <h3>${g.title} ${g.is_plus ? '<span class="badge plus">+Plus</span>' : ''}</h3>
-        <div class="muted">${g.platform} | ${g.region} | ظرفیت ${g.capacity}</div>
-        ${g.image_url ? `<img src="${g.image_url}" alt="${g.title}" style="max-width:100%; border-radius:10px; margin:8px 0;" />` : ''}
-        <p>${truncate(g.description, 120)}</p>
-        <div style="display:flex; justify-content:space-between; align-items:center;">
-          <strong>${g.display_price} تومان</strong>
-          ${g.out_of_stock ? '<span class="badge" style="background:#c62828;">ناموجود</span>' : '<span class="badge">موجود</span>'}
-        </div>
-        <div class="muted">برچسب‌ها: ${g.seo_tags || '---'}</div>
-      </article>`
+      (g) => {
+        const variants = (g.variants || [])
+          .map((v) => `<div class="badge-ghost" style="display:inline-block; margin:2px;">${v.platform.toUpperCase()} | ظرفیت ${v.capacity} | ${formatPrice(v.price)} تومان</div>`)
+          .join("") || `<div class="badge-ghost">${g.platform} | ظرفیت ${g.capacity}</div>`;
+        return `<article style="background:#0f132b; border:1px solid #1f2a55; padding:12px; border-radius:12px;">
+          <h3>${g.title} ${g.is_plus ? '<span class="badge plus">+Plus</span>' : ''}</h3>
+          <div class="muted">${g.region}</div>
+          ${g.image_url ? `<img src="${g.image_url}" alt="${g.title}" style="max-width:100%; border-radius:10px; margin:8px 0;" />` : ''}
+          <p>${truncate(g.description, 120)}</p>
+          <div style="display:flex; justify-content:space-between; align-items:center;">
+            <strong>${g.display_price} تومان</strong>
+            ${g.out_of_stock ? '<span class="badge" style="background:#c62828;">ناموجود</span>' : '<span class="badge">موجود</span>'}
+          </div>
+          <div class="muted" style="margin-top:6px;">${variants}</div>
+          <div class="muted">برچسب‌ها: ${g.seo_tags || '---'}</div>
+        </article>`;
+      }
     )
     .join("");
 
@@ -754,6 +953,11 @@ function renderStorefront(games) {
 }
 
 function renderGameDetail(game) {
+  const variants = (game.variants || [])
+    .map(
+      (v) => `<div class="badge-ghost" style="margin:4px 0; display:inline-block;">${v.platform.toUpperCase()} | ظرفیت ${v.capacity} | ${formatPrice(v.price)} تومان ${v.stock <= 0 ? '(ناموجود)' : ''}</div>`
+    )
+    .join("") || "";
   return `<!DOCTYPE html>
   <html lang="fa" dir="rtl">
   <head>
@@ -775,11 +979,12 @@ function renderGameDetail(game) {
     <div class="container">
       <a href="/store" class="muted">بازگشت به فروشگاه</a>
       <h1>${game.title} ${game.is_plus ? '<span class="badge plus">+Plus</span>' : ''}</h1>
-      <div class="muted">${game.platform} | ${game.region} | ظرفیت ${game.capacity}</div>
+      <div class="muted">${game.region}</div>
       ${game.image_url ? `<img src="${game.image_url}" alt="${game.title}" />` : ''}
       <p>${game.description || ''}</p>
       <div><strong>قیمت:</strong> ${formatPrice(game.price)} تومان</div>
       <div class="muted">${game.out_of_stock ? 'ناموجود' : 'موجود'}</div>
+      <div>${variants}</div>
       <div>${(game.seo_tags || '').split(',').filter(Boolean).map((t) => `<span class="tag">${t.trim()}</span>`).join('')}</div>
     </div>
   </body>
@@ -865,7 +1070,8 @@ async function handleRequest(request, env, ctx) {
     if (gameIdMatch && request.method === "GET") {
       const game = await getGameById(env, gameIdMatch[1]);
       if (!game) return htmlResponse(renderLayout("بازی یافت نشد", { title: "404" }), 404);
-      return htmlResponse(renderAdminGameForm(game));
+      const variantMap = await getVariantsForGames(env, [game.id], { includeInactive: true });
+      return htmlResponse(renderAdminGameForm(game, variantMap[game.id] || []));
     }
 
     // Update game
@@ -876,6 +1082,21 @@ async function handleRequest(request, env, ctx) {
       } catch (err) {
         return htmlResponse(renderLayout(`<div class=\"alert\">${err.message}</div>`));
       }
+    }
+
+    const variantMatch = url.pathname.match(/^\/admin\/games\/(\d+)\/variants$/);
+    if (variantMatch && request.method === "POST") {
+      const data = await parseFormData(request);
+      await upsertGameVariant(env, {
+        game_id: Number(variantMatch[1]),
+        platform: data.platform,
+        capacity: Number(data.capacity || 0),
+        price: Number(data.price || 0),
+        old_price: data.old_price ? Number(data.old_price) : null,
+        stock: Number(data.stock || 0),
+        is_active: parseBoolean(data.is_active ?? true),
+      });
+      return redirectResponse(`/admin/games/${variantMatch[1]}`);
     }
 
     // Soft delete
@@ -1615,6 +1836,21 @@ select:hover { border-color: var(--primary-neon); }
 .card-meta { display: flex; justify-content: space-between; font-size: 0.85rem; color: var(--text-muted); margin-bottom: 12px; }
 .card-footer { margin-top: auto; display: flex; justify-content: space-between; align-items: center; }
 .card-price { font-size: 1.2rem; font-weight: 800; color: var(--primary-neon); }
+.card-price.price-pulse { animation: pricePulse 0.25s ease-out; }
+
+.variant-switcher { display: flex; flex-direction: column; gap: 10px; margin-bottom: 14px; }
+.variant-row { display: flex; gap: 8px; flex-wrap: wrap; }
+.toggle-btn { padding: 8px 12px; border-radius: 10px; border: 1px solid #333; background: #0f0f15; color: #cfd9ff; cursor: pointer; transition: 0.2s; min-width: 68px; }
+.toggle-btn:hover:not(:disabled) { border-color: var(--primary-neon); color: white; box-shadow: 0 0 10px rgba(0,243,255,0.2); }
+.toggle-btn.active { background: linear-gradient(135deg, rgba(0,243,255,0.2), rgba(255,60,60,0.15)); border-color: var(--secondary-neon); color: white; box-shadow: 0 0 10px rgba(0,243,255,0.25); }
+.toggle-btn:disabled { opacity: 0.35; cursor: not-allowed; filter: grayscale(0.4); }
+.platform-btn { text-transform: uppercase; letter-spacing: 0.5px; }
+.capacity-btn { border-radius: 999px; font-weight: 700; }
+
+@keyframes pricePulse {
+    0% { transform: translateY(4px); opacity: 0.4; }
+    100% { transform: translateY(0); opacity: 1; }
+}
 
 .card-actions { display: flex; gap: 8px; }
 .btn-icon {
@@ -1976,20 +2212,35 @@ class InventoryManager {
 
             const { games = [] } = await response.json();
 
-            // Normalize payload to the UI schema
-            this.games = games.map((g) => ({
-                id: Number(g.id),
-                title: g.title,
-                platform: g.platform,
-                region: g.region,
-                capacity: Number(g.capacity),
-                stock: Number(g.stock),
-                price: Number(g.price),
-                image: g.image_url || 'https://via.placeholder.com/800x600?text=No+Image',
-                isPlusIncluded: Boolean(g.is_plus),
-                isFeatured: Boolean(g.is_plus),
-                desc: g.description || g.seo_description || CONFIG.DEFAULT_META_DESCRIPTION,
-            }));
+            this.games = games.map((g) => {
+                const variants = (g.variants && g.variants.length ? g.variants : [
+                    { id: g.id, platform: g.platform, capacity: g.capacity, price: g.price, stock: g.stock, is_active: 1 }
+                ])
+                    .map((v) => ({
+                        id: Number(String(v.id || (g.id + '-' + v.platform + '-' + v.capacity)).replace(/[^0-9]/g, '')),
+                        platform: (v.platform || '').toLowerCase(),
+                        capacity: Number(v.capacity),
+                        price: Number(v.price),
+                        stock: Number(v.stock),
+                        oldPrice: v.old_price ? Number(v.old_price) : null,
+                        is_active: v.is_active !== 0,
+                    }))
+                    .filter(v => v.platform && v.capacity);
+
+                const defaultVariant = this.pickDefaultVariant(variants);
+
+                return {
+                    id: Number(g.id),
+                    title: g.title,
+                    region: g.region,
+                    image: g.image_url || 'https://via.placeholder.com/800x600?text=No+Image',
+                    isPlusIncluded: Boolean(g.is_plus),
+                    isFeatured: Boolean(g.is_plus),
+                    desc: g.description || g.seo_description || CONFIG.DEFAULT_META_DESCRIPTION,
+                    variants,
+                    defaultVariant,
+                };
+            });
 
             // Keep legacy access points in sync for UI helpers
             DB.games = this.games;
@@ -1998,6 +2249,17 @@ class InventoryManager {
             console.error('Game fetch failed', err);
             this.ui.showToast('خطا در بارگذاری بازی‌ها. لطفاً دوباره تلاش کنید.', 'error');
         }
+    }
+
+    pickDefaultVariant(variants = []) {
+        if (!variants.length) return null;
+
+        const active = variants.filter(v => v.is_active !== false && v.stock >= 0);
+        const preferred = active.find(v => v.platform === 'ps5' && v.capacity === 2);
+        if (preferred) return preferred;
+
+        const cheapest = active.slice().sort((a, b) => a.price - b.price)[0];
+        return cheapest || variants[0];
     }
 
     applyFilters() {
@@ -2010,14 +2272,15 @@ class InventoryManager {
         let filtered = [...this.games];
 
         // Filters
-        if (pFilter !== 'all') filtered = filtered.filter(g => g.platform === pFilter);
-        if (cFilter !== 'all') filtered = filtered.filter(g => g.capacity.toString() === cFilter);
-        if (stockOnly) filtered = filtered.filter(g => g.stock > 0);
+        if (pFilter !== 'all') filtered = filtered.filter(g => g.variants.some(v => v.platform === pFilter));
+        if (cFilter !== 'all') filtered = filtered.filter(g => g.variants.some(v => v.capacity.toString() === cFilter));
+        if (stockOnly) filtered = filtered.filter(g => g.variants.some(v => v.stock > 0 && v.is_active !== false));
         if (plusOnly) filtered = filtered.filter(g => g.isPlusIncluded);
 
         // Sorting
-        if (sort === 'price-asc') filtered.sort((a, b) => a.price - b.price);
-        else if (sort === 'price-desc') filtered.sort((a, b) => b.price - a.price);
+        const priceOf = (g) => (this.pickDefaultVariant(g.variants) || g.variants[0]).price;
+        if (sort === 'price-asc') filtered.sort((a, b) => priceOf(a) - priceOf(b));
+        else if (sort === 'price-desc') filtered.sort((a, b) => priceOf(b) - priceOf(a));
         else if (sort === 'newest') filtered.reverse(); // Simplified newest logic
 
         // Render
@@ -2044,9 +2307,13 @@ class InventoryManager {
     }
 
     addToCart(id, type) {
-        const source = type === 'game' ? this.games : DB.plus;
-        const item = source.find(x => x.id === id);
-        
+        let item;
+        if (type === 'game') {
+            item = this.findVariantById(id);
+        } else {
+            item = DB.plus.find(x => x.id === id);
+        }
+
         if (!item) return;
         if (type === 'game' && item.stock <= 0) {
             this.ui.showToast('موجودی این محصول به پایان رسیده است.', 'error');
@@ -2061,8 +2328,31 @@ class InventoryManager {
             this.saveData();
             this.ui.updateCartUI(this.cart);
             this.ui.toggleCart(true);
-            this.ui.showToast(\`\${item.title} به سبد اضافه شد.\`, 'success');
+            this.ui.showToast(item.title + ' به سبد اضافه شد.', 'success');
         }
+    }
+
+    findVariantById(variantId) {
+        let found = null;
+        this.games.some((g) => {
+            const variant = g.variants.find(v => v.id === variantId);
+            if (variant) {
+                found = {
+                    ...variant,
+                    gameId: g.id,
+                    title: g.title,
+                    image: g.image,
+                    region: g.region,
+                    desc: g.desc,
+                    isPlusIncluded: g.isPlusIncluded,
+                    isFeatured: g.isFeatured,
+                    variantLabel: (variant.platform || '').toUpperCase() + ' ظرفیت ' + variant.capacity,
+                };
+                return true;
+            }
+            return false;
+        });
+        return found;
     }
 
     removeFromCart(id) {
@@ -2110,7 +2400,7 @@ class InventoryManager {
         let msg = "سلام GalaxyZone، درخواست خرید موارد زیر را دارم:%0A%0A";
         let total = 0;
         this.cart.forEach((item, index) => {
-            msg += \`\${index + 1}. \${item.title} (\${item.platform || item.duration}) - \${item.price.toLocaleString()}\%0A\`;
+            msg += \`\${index + 1}. \${item.title} (\${item.variantLabel || item.platform || item.duration}) - \${item.price.toLocaleString()}\%0A\`;
             total += item.price;
         });
         
@@ -2153,7 +2443,7 @@ class UIManager {
 
     renderGames(games) {
         this.elems.gameGrid.innerHTML = '';
-        
+
         if (games.length === 0) {
             this.elems.noResults.classList.remove('hidden');
         } else {
@@ -2180,41 +2470,113 @@ class UIManager {
 
     createGameCard(game) {
         const isLiked = this.inventory.wishlist.includes(game.id);
-        const inStock = game.stock > 0;
-        
+        const findVariant = (platform, capacity) => game.variants.find(v => v.platform === platform && Number(v.capacity) === Number(capacity) && v.is_active !== false);
+        let currentVariant = game.defaultVariant && game.defaultVariant.is_active !== false ? game.defaultVariant : this.inventory.pickDefaultVariant(game.variants);
+        if (!currentVariant) currentVariant = game.variants[0];
+
         const div = document.createElement('div');
         div.className = 'game-card';
-        div.innerHTML = \`
-            <div class="card-image-wrapper" onclick="window.app.ui.openProductModal(\${game.id})">
-                <img src="\${game.image}" alt="\${game.title}" class="card-img" loading="lazy">
-                <div class="card-overlay"></div>
-                <div class="card-badges">
-                    <span class="badge-item badge-stock \${inStock ? 'in' : 'out'}">
-                        \${inStock ? 'موجود: ' + game.stock : 'ناموجود'}
-                    </span>
-                    \${game.isPlusIncluded ? '<span class="badge-item badge-plus">+Plus</span>' : ''}
-                </div>
-            </div>
-            <div class="card-content">
-                <h4 class="card-title">\${game.title}</h4>
-                <div class="card-meta">
-                    <span><i class="fab fa-playstation"></i> \${game.platform}</span>
-                    <span><i class="fas fa-globe"></i> \${game.region}</span>
-                    <span>\${game.capacity === 2 ? 'ظرفیت ۲' : 'ظرفیت ۳'}</span>
-                </div>
-                <div class="card-footer">
-                    <span class="card-price">\${game.price.toLocaleString()}</span>
-                    <div class="card-actions">
-                        <button class="btn-icon btn-fav \${isLiked ? 'active' : ''}" onclick="window.app.inventory.toggleWishlist(\${game.id})">
-                            <i class="\${isLiked ? 'fas' : 'far'} fa-heart"></i>
-                        </button>
-                        <button class="btn-icon btn-cart" \${!inStock ? 'disabled style="opacity:0.5"' : ''} onclick="window.app.inventory.addToCart(\${game.id}, 'game')">
-                            <i class="fas fa-plus"></i>
-                        </button>
-                    </div>
-                </div>
-            </div>
-        \`;
+        div.dataset.gameId = game.id;
+
+        div.innerHTML =
+            '<div class="card-image-wrapper" onclick="window.app.ui.openProductModal(' + game.id + ')">' +
+                '<img src="' + game.image + '" alt="' + game.title + '" class="card-img" loading="lazy">' +
+                '<div class="card-overlay"></div>' +
+                '<div class="card-badges">' +
+                    '<span class="badge-item badge-stock"></span>' +
+                    (game.isPlusIncluded ? '<span class="badge-item badge-plus">+Plus</span>' : '') +
+                '</div>' +
+            '</div>' +
+            '<div class="card-content">' +
+                '<h4 class="card-title">' + game.title + '</h4>' +
+                '<div class="card-meta">' +
+                    '<span class="meta-platform"><i class="fab fa-playstation"></i> ' + currentVariant.platform.toUpperCase() + '</span>' +
+                    '<span><i class="fas fa-globe"></i> ' + game.region + '</span>' +
+                    '<span class="meta-capacity">ظرفیت ' + currentVariant.capacity + '</span>' +
+                '</div>' +
+                '<div class="variant-switcher">' +
+                    '<div class="variant-row variant-platform"></div>' +
+                    '<div class="variant-row variant-capacity"></div>' +
+                '</div>' +
+                '<div class="card-footer">' +
+                    '<span class="card-price">' + currentVariant.price.toLocaleString() + '</span>' +
+                    '<div class="card-actions">' +
+                        '<button class="btn-icon btn-fav ' + (isLiked ? 'active' : '') + '"><i class="' + (isLiked ? 'fas' : 'far') + ' fa-heart"></i></button>' +
+                        '<button class="btn-icon btn-cart"><i class="fas fa-plus"></i></button>' +
+                    '</div>' +
+                '</div>' +
+            '</div>';
+
+        const stockBadge = div.querySelector('.badge-stock');
+        const priceEl = div.querySelector('.card-price');
+        const metaPlatform = div.querySelector('.meta-platform');
+        const metaCapacity = div.querySelector('.meta-capacity');
+        const favBtn = div.querySelector('.btn-fav');
+        const cartBtn = div.querySelector('.btn-cart');
+        const platformRow = div.querySelector('.variant-platform');
+        const capacityRow = div.querySelector('.variant-capacity');
+
+        const platformOptions = ['ps4', 'ps5'];
+        platformOptions.forEach((plat) => {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'toggle-btn platform-btn';
+            btn.textContent = plat.toUpperCase();
+            const hasVariant = game.variants.some(v => v.platform === plat && v.is_active !== false);
+            if (!hasVariant) btn.disabled = true;
+            if (plat === currentVariant.platform) btn.classList.add('active');
+            btn.addEventListener('click', () => {
+                if (btn.disabled) return;
+                platformRow.querySelectorAll('button').forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                const candidate = findVariant(plat, currentVariant.capacity) || this.inventory.pickDefaultVariant(game.variants.filter(v => v.platform === plat));
+                if (candidate) {
+                    currentVariant = candidate;
+                    syncVariant();
+                }
+            });
+            platformRow.appendChild(btn);
+        });
+
+        [1,2,3].forEach((cap) => {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'toggle-btn capacity-btn';
+            btn.textContent = cap;
+            const hasVariant = findVariant(currentVariant.platform, cap) || findVariant('ps4', cap) || findVariant('ps5', cap);
+            if (!hasVariant) btn.disabled = true;
+            if (cap === Number(currentVariant.capacity)) btn.classList.add('active');
+            btn.addEventListener('click', () => {
+                if (btn.disabled) return;
+                capacityRow.querySelectorAll('button').forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                const candidate = findVariant(currentVariant.platform, cap) || findVariant(platformOptions.find(p => findVariant(p, cap)), cap);
+                if (candidate) {
+                    currentVariant = candidate;
+                    syncVariant();
+                }
+            });
+            capacityRow.appendChild(btn);
+        });
+
+        favBtn.addEventListener('click', () => this.inventory.toggleWishlist(game.id));
+        cartBtn.addEventListener('click', () => this.inventory.addToCart(currentVariant.id, 'game'));
+
+        const syncVariant = () => {
+            const inStock = currentVariant.stock > 0 && currentVariant.is_active !== false;
+            stockBadge.textContent = inStock ? 'موجود: ' + currentVariant.stock : 'ناموجود';
+            stockBadge.classList.toggle('in', inStock);
+            stockBadge.classList.toggle('out', !inStock);
+            metaPlatform.innerHTML = '<i class="fab fa-playstation"></i> ' + currentVariant.platform.toUpperCase();
+            metaCapacity.textContent = 'ظرفیت ' + currentVariant.capacity;
+            priceEl.textContent = currentVariant.price.toLocaleString();
+            priceEl.classList.add('price-pulse');
+            setTimeout(() => priceEl.classList.remove('price-pulse'), 250);
+            cartBtn.disabled = !inStock;
+            cartBtn.style.opacity = inStock ? '1' : '0.5';
+        };
+
+        syncVariant();
         return div;
     }
 
@@ -2239,19 +2601,21 @@ class UIManager {
 
     renderSearchResults(results) {
         this.elems.searchResults.innerHTML = '';
-        
+
         if (results.length > 0) {
             this.elems.searchResults.classList.add('active');
             results.forEach(item => {
+                const variant = item.defaultVariant || this.inventory.pickDefaultVariant(item.variants) || item.variants[0];
+                if (!variant) return;
+                const variantLabel = (variant.platform || '').toUpperCase() + ' | ظرفیت ' + variant.capacity;
                 const div = document.createElement('div');
                 div.className = 'search-item';
-                div.innerHTML = \`
-                    <img src="\${item.image}" alt="">
-                    <div>
-                        <div style="font-weight:bold">\${item.title}</div>
-                        <div style="font-size:0.8rem;color:#aaa">\${item.platform} | \${item.price.toLocaleString()}</div>
-                    </div>
-                \`;
+                div.innerHTML =
+                    '<img src="' + (item.image || 'https://via.placeholder.com/60') + '" alt="">' +
+                    '<div>' +
+                        '<div style="font-weight:bold">' + item.title + '</div>' +
+                        '<div style="font-size:0.8rem;color:#aaa">' + variantLabel + ' | ' + variant.price.toLocaleString() + '</div>' +
+                    '</div>';
                 div.onclick = () => {
                     this.openProductModal(item.id);
                     this.elems.searchResults.classList.remove('active');
@@ -2357,27 +2721,30 @@ class UIManager {
     }
 
     openProductModal(id) {
-        const item = (this.inventory?.games || []).find(g => g.id === id);
-        if(!item) return;
+        const game = (this.inventory?.games || []).find(g => g.id === id);
+        if(!game) return;
 
-        this.elems.modalDetails.innerHTML = \`
-            <img src="\${item.image}" class="modal-hero">
-            <div class="modal-info">
-                <h2 class="modal-title">\${item.title}</h2>
-                <div class="modal-tags">
-                    <span class="tag">\${item.platform}</span>
-                    <span class="tag">Region \${item.region}</span>
-                    <span class="tag">Capacity \${item.capacity}</span>
-                </div>
-                <p class="modal-desc">\${item.desc}</p>
-                <div class="modal-price-box">
-                    <span style="font-size:1.5rem;font-weight:bold;color:#00f3ff">\${item.price.toLocaleString()} تومان</span>
-                    <button class="btn-primary" onclick="window.app.inventory.addToCart(\${item.id}, 'game');window.app.ui.closeModal()">
-                        <i class="fas fa-shopping-cart"></i> خرید کنید
-                    </button>
-                </div>
-            </div>
-        \`;
+        const variant = game.defaultVariant || this.inventory.pickDefaultVariant(game.variants) || game.variants[0];
+        if (!variant) return;
+
+        const modalCapacity = 'ظرفیت ' + variant.capacity;
+        this.elems.modalDetails.innerHTML =
+            '<img src="' + game.image + '" class="modal-hero">' +
+            '<div class="modal-info">' +
+                '<h2 class="modal-title">' + game.title + '</h2>' +
+                '<div class="modal-tags">' +
+                    '<span class="tag">' + (variant.platform || '').toUpperCase() + '</span>' +
+                    '<span class="tag">Region ' + game.region + '</span>' +
+                    '<span class="tag">' + modalCapacity + '</span>' +
+                '</div>' +
+                '<p class="modal-desc">' + game.desc + '</p>' +
+                '<div class="modal-price-box">' +
+                    '<span style="font-size:1.5rem;font-weight:bold;color:#00f3ff">' + variant.price.toLocaleString() + ' تومان</span>' +
+                    '<button class="btn-primary" onclick="window.app.inventory.addToCart(' + variant.id + ', \"game\");window.app.ui.closeModal()">' +
+                        '<i class="fas fa-shopping-cart"></i> خرید کنید' +
+                    '</button>' +
+                '</div>' +
+            '</div>';
         this.elems.productModal.style.display = 'flex';
     }
 
