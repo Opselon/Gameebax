@@ -380,9 +380,11 @@ function normalizeGamePayload(data) {
   if (!data.region) throw new Error("Missing required field: region");
 
   const variants = PLATFORM_CAPACITY_MATRIX.map(({ platform, capacity }) => {
-    const price = Number(data[`variant_price_${platform}_${capacity}`]);
-    const stock = Number(data[`variant_stock_${platform}_${capacity}`]);
-    const is_active = parseBoolean(data[`variant_active_${platform}_${capacity}`] ?? true);
+    const priceInput = data[`variant_price_${platform}_${capacity}`];
+    const stockInput = data[`variant_stock_${platform}_${capacity}`];
+    const price = priceInput === "" || priceInput === undefined ? 0 : Number(priceInput);
+    const stock = stockInput === "" || stockInput === undefined ? 0 : Number(stockInput);
+    const is_active = parseBoolean(data[`variant_active_${platform}_${capacity}`] ?? false);
     return {
       platform,
       capacity,
@@ -828,15 +830,21 @@ function renderAdminDashboard(games, filters = {}, summary = {}) {
 function renderAdminGameForm(game = null, variants = []) {
   const isEdit = Boolean(game);
   const action = isEdit ? `/admin/games/${game.id}` : "/admin/games";
-  const existingVariants = {};
-  (variants || []).forEach((v) => {
-    existingVariants[`${v.platform?.toUpperCase?.() || v.platform}_${v.capacity}`] = v;
-  });
+  const variantMap = (variants || []).reduce((acc, v) => {
+    if (!v) return acc;
+    const platformKey = (v.platform || "").toString().toUpperCase();
+    const capacityKey = Number(v.capacity);
+    if (!platformKey || Number.isNaN(capacityKey)) return acc;
+    acc[`${platformKey}-${capacityKey}`] = v;
+    return acc;
+  }, {});
 
   const variantRows = PLATFORM_CAPACITY_MATRIX.map(({ platform, capacity }) => {
-    const key = `${platform}_${capacity}`;
-    const v = existingVariants[key] || {};
-    const activeChecked = v.is_active === undefined ? true : Boolean(v.is_active);
+    const key = `${platform}-${capacity}`;
+    const v = variantMap[key];
+    const priceValue = v && v.price !== undefined && v.price !== null ? v.price : 0;
+    const stockValue = v && v.stock !== undefined && v.stock !== null ? v.stock : 0;
+    const activeChecked = v ? Boolean(v.is_active) : false;
     return `<div class="variant-row">
       <div class="variant-row__title">
         <span>${platform} | ظرفیت ${capacity}</span>
@@ -846,10 +854,10 @@ function renderAdminGameForm(game = null, variants = []) {
         </label>
       </div>
       <label>قیمت (تومان)
-        <input required type="number" min="0" name="variant_price_${platform}_${capacity}" value="${v.price ?? ""}" />
+        <input type="number" min="0" name="variant_price_${platform}_${capacity}" value="${priceValue}" />
       </label>
       <label>موجودی
-        <input type="number" min="0" name="variant_stock_${platform}_${capacity}" value="${v.stock ?? ""}" />
+        <input type="number" min="0" name="variant_stock_${platform}_${capacity}" value="${stockValue}" />
       </label>
     </div>`;
   }).join("");
