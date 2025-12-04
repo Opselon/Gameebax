@@ -1517,8 +1517,7 @@ const htmlContent = `
 
     <!-- Product Detail Modal -->
     <div id="product-modal" class="modal">
-        <div class="modal-content glass-panel">
-            <span class="close-modal" onclick="window.app.ui.closeModal()">&times;</span>
+        <div class="modal-content modal-dark">
             <div class="modal-body" id="modal-details">
                 <!-- Content injected via JS -->
             </div>
@@ -1970,25 +1969,30 @@ select:hover { border-color: var(--primary-neon); }
 }
 @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
 .modal-content {
-    width: 100%; max-width: 700px; padding: 0; border-radius: 16px; position: relative;
-    max-height: 90vh; overflow-y: auto;
+    width: 100%; max-width: 720px; padding: 0; border-radius: 18px; position: relative;
+    max-height: 90vh; overflow-y: auto; background: #151520; border: 1px solid #1f1f2a;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.45); color: #f5f6ff;
 }
 .close-modal {
-    position: absolute; left: 15px; top: 15px; color: white; font-size: 2rem; z-index: 10; cursor: pointer;
-    background: rgba(0,0,0,0.5); width: 40px; height: 40px; border-radius: 50%;
-    display: flex; align-items: center; justify-content: center;
+    position: absolute; left: 14px; top: 14px; color: white; font-size: 1.2rem; z-index: 10; cursor: pointer;
+    background: rgba(0,0,0,0.55); width: 38px; height: 38px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center; border: 1px solid #2a2a35;
+    box-shadow: 0 6px 16px rgba(0,0,0,0.35);
 }
-.modal-body { display: flex; flex-direction: column; }
-.modal-hero { width: 100%; height: 300px; object-fit: cover; }
-.modal-info { padding: 25px; }
-.modal-title { font-size: 1.8rem; margin-bottom: 10px; }
-.modal-tags { display: flex; gap: 10px; margin-bottom: 20px; }
-.tag { padding: 5px 10px; background: #222; border-radius: 5px; font-size: 0.8rem; border: 1px solid #444; }
-.modal-desc { color: #ccc; margin-bottom: 25px; line-height: 1.7; }
-.modal-price-box {
-    display: flex; justify-content: space-between; align-items: center;
-    background: rgba(0,0,0,0.3); padding: 15px; border-radius: 10px;
-}
+.modal-body { display: flex; flex-direction: column; padding: 0; min-height: 100%; }
+.modal-hero-wrap { position: relative; }
+.modal-hero { width: 100%; height: 250px; object-fit: cover; display: block; border-radius: 18px 18px 0 0; }
+.modal-info { padding: 22px 24px 12px; text-align: right; }
+.modal-title { font-size: 1.85rem; margin: 0 0 12px; font-weight: 800; color: #fff; }
+.modal-tags { display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; }
+.tag-pill { padding: 6px 12px; background: #191922; border-radius: 999px; font-size: 0.85rem; border: 1px solid #2c2c35; color: #d7d7e0; }
+.modal-desc { color: #b3b3c3; margin: 0 0 18px; line-height: 1.8; }
+.modal-footer { position: sticky; bottom: 0; background: #1b1b26; border-top: 1px solid #242436; padding: 16px 24px; display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap; }
+.modal-price { display: flex; flex-direction: column; gap: 4px; }
+.modal-price-label { color: #8d8da1; font-size: 0.9rem; }
+.modal-price-value { color: #3bd4ff; font-size: 1.6rem; font-weight: 800; letter-spacing: 0.3px; transition: transform 0.2s ease, opacity 0.2s ease; }
+.btn-buy { background: linear-gradient(135deg, #7a5bff, #b43eff); color: white; border: none; padding: 14px 18px; border-radius: 12px; font-weight: 800; display: flex; align-items: center; justify-content: center; gap: 10px; cursor: pointer; box-shadow: 0 10px 30px rgba(122,91,255,0.35); min-width: 180px; flex: 1 0 180px; }
+.btn-buy:hover { transform: translateY(-1px); box-shadow: 0 12px 32px rgba(122,91,255,0.45); }
 
 /* --- Toasts --- */
 #toast-container { position: fixed; bottom: 30px; right: 30px; z-index: 9999; display: flex; flex-direction: column; gap: 15px; }
@@ -2487,7 +2491,7 @@ class UIManager {
         div.dataset.gameId = game.id;
 
         div.innerHTML =
-            '<div class="card-image-wrapper" onclick="window.app.ui.openProductModal(' + game.id + ')">' +
+            '<div class="card-image-wrapper">' +
                 '<img src="' + game.image + '" alt="' + game.title + '" class="card-img" loading="lazy">' +
                 '<div class="card-overlay"></div>' +
                 '<div class="card-badges">' +
@@ -2523,6 +2527,7 @@ class UIManager {
         const cartBtn = div.querySelector('.btn-cart');
         const platformRow = div.querySelector('.variant-platform');
         const capacityRow = div.querySelector('.variant-capacity');
+        const imageWrapper = div.querySelector('.card-image-wrapper');
 
         const platformOptions = ['ps4', 'ps5'];
         platformOptions.forEach((plat) => {
@@ -2569,6 +2574,7 @@ class UIManager {
 
         favBtn.addEventListener('click', () => this.inventory.toggleWishlist(game.id));
         cartBtn.addEventListener('click', () => this.inventory.addToCart(currentVariant.id, 'game'));
+        imageWrapper.addEventListener('click', () => this.openProductModal(game.id, currentVariant));
 
         const syncVariant = () => {
             const inStock = currentVariant.stock > 0 && currentVariant.is_active !== false;
@@ -2728,30 +2734,37 @@ class UIManager {
         document.getElementById('mobile-menu').classList.toggle('active');
     }
 
-    openProductModal(id) {
+    openProductModal(id, chosenVariant) {
         const game = (this.inventory?.games || []).find(g => g.id === id);
         if(!game) return;
 
-        const variant = game.defaultVariant || this.inventory.pickDefaultVariant(game.variants) || game.variants[0];
+        const variant = chosenVariant || game.defaultVariant || this.inventory.pickDefaultVariant(game.variants) || game.variants[0];
         if (!variant) return;
 
         const modalCapacity = 'ظرفیت ' + variant.capacity;
+        const platformLabel = (variant.platform || '').toUpperCase();
         this.elems.modalDetails.innerHTML =
-            '<img src="' + game.image + '" class="modal-hero">' +
+            '<div class="modal-hero-wrap">' +
+                '<img src="' + game.image + '" class="modal-hero" alt="' + game.title + '">' +
+                '<button class="close-modal" onclick="window.app.ui.closeModal()"><i class="fas fa-times"></i></button>' +
+            '</div>' +
             '<div class="modal-info">' +
                 '<h2 class="modal-title">' + game.title + '</h2>' +
                 '<div class="modal-tags">' +
-                    '<span class="tag">' + (variant.platform || '').toUpperCase() + '</span>' +
-                    '<span class="tag">Region ' + game.region + '</span>' +
-                    '<span class="tag">' + modalCapacity + '</span>' +
+                    '<span class="tag-pill">' + platformLabel + '</span>' +
+                    '<span class="tag-pill">Region ' + game.region + '</span>' +
+                    '<span class="tag-pill">' + modalCapacity + '</span>' +
                 '</div>' +
                 '<p class="modal-desc">' + game.desc + '</p>' +
-                '<div class="modal-price-box">' +
-                    '<span style="font-size:1.5rem;font-weight:bold;color:#00f3ff">' + variant.price.toLocaleString() + ' تومان</span>' +
-                    '<button class="btn-primary" onclick="window.app.inventory.addToCart(' + variant.id + ', \"game\");window.app.ui.closeModal()">' +
-                        '<i class="fas fa-shopping-cart"></i> خرید کنید' +
-                    '</button>' +
+            '</div>' +
+            '<div class="modal-footer">' +
+                '<div class="modal-price">' +
+                    '<span class="modal-price-label">قیمت</span>' +
+                    '<div class="modal-price-value">' + variant.price.toLocaleString() + ' تومان</div>' +
                 '</div>' +
+                '<button class="btn-buy" onclick="window.app.inventory.addToCart(' + variant.id + ', \"game\");window.app.ui.closeModal()">' +
+                    '<i class="fas fa-shopping-cart"></i> خرید کنید' +
+                '</button>' +
             '</div>';
         this.elems.productModal.style.display = 'flex';
     }
