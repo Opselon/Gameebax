@@ -721,6 +721,16 @@ async function updateStock(env, id, newStock) {
   await stmt.bind(newStock, id).run();
 }
 
+async function restoreGame(env, id) {
+  const stmt = env.DB.prepare("UPDATE games SET active = 1 WHERE id = ?");
+  await stmt.bind(id).run();
+}
+
+async function hardDeleteGame(env, id) {
+  const stmt = env.DB.prepare("DELETE FROM games WHERE id = ?");
+  await stmt.bind(id).run();
+}
+
 async function getDashboardSummary(env) {
   const aggregate =
     (await env.DB.prepare(
@@ -967,9 +977,12 @@ function renderAdminDashboard(games, filters = {}, summary = {}) {
         <td>${g.seo_tags || '-'}</td>
         <td>
           <a class="btn btn-secondary" href="/admin/games/${g.id}">ویرایش</a>
-          <form method="POST" action="/admin/games/${g.id}/delete" style="display:inline;">
+          <form method="POST" action="/admin/games/${g.id}/delete" style="display:inline;" onsubmit="return confirm('بازی غیرفعال می‌شود. ادامه می‌دهید؟');">
             <button class="btn btn-danger" type="submit">حذف نرم</button>
           </form>
+          ${!g.active ? `<form method="POST" action="/admin/games/${g.id}/restore" style="display:inline;">
+            <button class="btn" type="submit">بازگردانی</button>
+          </form>` : ''}
           <form method="POST" action="/admin/games/${g.id}" style="display:inline;">
             <input type="hidden" name="title" value="${g.title}" />
             <input type="hidden" name="platform" value="${g.platform}" />
@@ -985,6 +998,9 @@ function renderAdminDashboard(games, filters = {}, summary = {}) {
             <input type="hidden" name="seo_description" value="${g.seo_description || ''}" />
             <input type="hidden" name="seo_tags" value="${g.seo_tags || ''}" />
             <button class="btn" type="submit">${g.active ? 'Deactivate' : 'Activate'}</button>
+          </form>
+          <form method="POST" action="/admin/games/${g.id}/purge" style="display:inline;" onsubmit="return confirm('حذف دائمی و غیرقابل بازگشت است. مطمئن هستید؟');">
+            <button class="btn btn-danger" type="submit">حذف دائمی</button>
           </form>
         </td>
       </tr>`
@@ -1331,6 +1347,20 @@ async function handleRequest(request, env, ctx) {
     const deleteMatch = url.pathname.match(/^\/admin\/games\/(\d+)\/delete$/);
     if (deleteMatch && request.method === "POST") {
       await softDeleteGame(env, deleteMatch[1]);
+      return redirectResponse("/admin");
+    }
+
+    // Restore
+    const restoreMatch = url.pathname.match(/^\/admin\/games\/(\d+)\/restore$/);
+    if (restoreMatch && request.method === "POST") {
+      await restoreGame(env, restoreMatch[1]);
+      return redirectResponse("/admin");
+    }
+
+    // Hard delete
+    const purgeMatch = url.pathname.match(/^\/admin\/games\/(\d+)\/purge$/);
+    if (purgeMatch && request.method === "POST") {
+      await hardDeleteGame(env, purgeMatch[1]);
       return redirectResponse("/admin");
     }
 
@@ -2245,112 +2275,7 @@ const jsContent = `
 
 // --- 1. Database (Product Data) ---
 const DB = {
-    games: [
-        { 
-            id: 1, 
-            title: "God of War Ragnarök", 
-            platform: "PS5", 
-            price: 1350000, 
-            capacity: 2, 
-            stock: 8, 
-            image: "https://images.unsplash.com/photo-1542751371-adc38448a05e?q=80&w=800&auto=format&fit=crop", 
-            region: "TR", 
-            isPlusIncluded: false,
-            isFeatured: true,
-            desc: "پایان حماسی نورس. کریتوس و آترئوس باید برای هر گزینه‌ای آماده باشند. گرافیک خیره‌کننده و گیم‌پلی بهبود یافته."
-        },
-        { 
-            id: 2, 
-            title: "Elden Ring", 
-            platform: "PS5", 
-            price: 1100000, 
-            capacity: 3, 
-            stock: 3, 
-            image: "https://images.unsplash.com/photo-1605901309584-818e25960b8f?q=80&w=800&auto=format&fit=crop", 
-            region: "US", 
-            isPlusIncluded: false,
-            isFeatured: true,
-            desc: "برنده جایزه بهترین بازی سال. در سرزمین‌های میانه کاوش کنید و الدن رینگ را تصاحب کنید. ساخته میازاکی."
-        },
-        { 
-            id: 3, 
-            title: "FC 24 (FIFA)", 
-            platform: "PS4", 
-            price: 950000, 
-            capacity: 2, 
-            stock: 0, 
-            image: "https://images.unsplash.com/photo-1511512578047-dfb367046420?q=80&w=800&auto=format&fit=crop", 
-            region: "UAE", 
-            isPlusIncluded: false,
-            isFeatured: false,
-            desc: "واقع‌گرایانه‌ترین تجربه فوتبال با تکنولوژی HyperMotion V و لایسنس‌های کامل لیگ‌های جهانی."
-        },
-        { 
-            id: 4, 
-            title: "Spider-Man 2", 
-            platform: "PS5", 
-            price: 1600000, 
-            capacity: 1, 
-            stock: 12, 
-            image: "https://images.unsplash.com/photo-1612036782180-6f0b6cd846fe?q=80&w=800&auto=format&fit=crop", 
-            region: "US", 
-            isPlusIncluded: true,
-            isFeatured: true,
-            desc: "پیتر پارکر و مایلز مورالز در برابر ونوم. تاب‌خوردن در نیویورک با سرعت SSD پلی‌استیشن ۵."
-        },
-        { 
-            id: 5, 
-            title: "The Last of Us Part I", 
-            platform: "PS5", 
-            price: 1250000, 
-            capacity: 2, 
-            stock: 5, 
-            image: "https://images.unsplash.com/photo-1552820728-8b83bb6b773f?q=80&w=800&auto=format&fit=crop", 
-            region: "US", 
-            isPlusIncluded: false,
-            isFeatured: false,
-            desc: "بازسازی کامل نسخه اول. تجربه‌ای احساسی از سفر جوئل و الی در دنیایی نابود شده."
-        },
-        { 
-            id: 6, 
-            title: "Red Dead Redemption 2", 
-            platform: "PS4", 
-            price: 400000, 
-            capacity: 3, 
-            stock: 10, 
-            image: "https://images.unsplash.com/photo-1500964757637-c85e8a162699?q=80&w=800&auto=format&fit=crop", 
-            region: "TR", 
-            isPlusIncluded: false,
-            isFeatured: true,
-            desc: "شاهکار راک‌استار. زندگی در غرب وحشی و داستان آرتور مورگان در دوران افول یاغی‌گری."
-        },
-        {
-            id: 7,
-            title: "Call of Duty: MW3",
-            platform: "PS5",
-            price: 1800000,
-            capacity: 2,
-            stock: 4,
-            image: "https://images.unsplash.com/photo-1534423861386-85a16f5d13fd?q=80&w=800&auto=format&fit=crop",
-            region: "US",
-            isPlusIncluded: true,
-            isFeatured: false,
-            desc: "جنگ مدرن با گرافیک نسل نهم. کمپین داستانی هیجان‌انگیز و بخش مولتی‌پلیر محبوب."
-        },
-        {
-            id: 8,
-            title: "Assassin's Creed Mirage",
-            platform: "PS4",
-            price: 850000,
-            capacity: 2,
-            stock: 7,
-            image: "https://images.unsplash.com/photo-1595429035839-c99c298ffdde?q=80&w=800&auto=format&fit=crop",
-            region: "EU",
-            isPlusIncluded: false,
-            isFeatured: false,
-            desc: "بازگشت به ریشه‌ها در بغداد. مخفی‌کاری و پارکور به سبک کلاسیک اساسینز کرید."
-        }
-    ],
+    games: [], // Populated at runtime from the secure /games API endpoint
     plus: [
         { id: 101, title: "PS Plus Essential", duration: "1 ماهه", price: 350000, type: "Essential", icon: "fa-star" },
         { id: 102, title: "PS Plus Extra", duration: "3 ماهه", price: 1400000, type: "Extra", icon: "fa-star-half-alt" },
@@ -2489,12 +2414,14 @@ class VisualEngine {
 class InventoryManager {
     constructor(ui) {
         this.ui = ui;
+        this.games = []; // Always hydrated from the backend API to avoid stale/static data
         this.cart = JSON.parse(localStorage.getItem('gz_cart')) || [];
         this.wishlist = JSON.parse(localStorage.getItem('gz_wishlist')) || [];
     }
 
     init() {
-        this.applyFilters();
+        // Securely hydrate products from the Worker API instead of static JSON
+        this.loadGamesFromApi();
         this.ui.updateCartUI(this.cart);
         this.ui.updateWishlistUI(this.wishlist);
         
@@ -2507,6 +2434,37 @@ class InventoryManager {
         });
     }
 
+    async loadGamesFromApi() {
+        try {
+            const response = await fetch('/games', { headers: { 'Accept': 'application/json' } });
+            if (!response.ok) throw new Error('Failed to load games');
+
+            const { games = [] } = await response.json();
+
+            // Normalize payload to the UI schema
+            this.games = games.map((g) => ({
+                id: Number(g.id),
+                title: g.title,
+                platform: g.platform,
+                region: g.region,
+                capacity: Number(g.capacity),
+                stock: Number(g.stock),
+                price: Number(g.price),
+                image: g.image_url || 'https://via.placeholder.com/800x600?text=No+Image',
+                isPlusIncluded: Boolean(g.is_plus),
+                isFeatured: Boolean(g.is_plus),
+                desc: g.description || g.seo_description || CONFIG.DEFAULT_META_DESCRIPTION,
+            }));
+
+            // Keep legacy access points in sync for UI helpers
+            DB.games = this.games;
+            this.applyFilters();
+        } catch (err) {
+            console.error('Game fetch failed', err);
+            this.ui.showToast('خطا در بارگذاری بازی‌ها. لطفاً دوباره تلاش کنید.', 'error');
+        }
+    }
+
     applyFilters() {
         const pFilter = document.getElementById('filter-platform').value;
         const cFilter = document.getElementById('filter-capacity').value;
@@ -2514,7 +2472,7 @@ class InventoryManager {
         const stockOnly = document.getElementById('filter-stock').checked;
         const plusOnly = document.getElementById('filter-plus').checked;
 
-        let filtered = [...DB.games];
+        let filtered = [...this.games];
 
         // Filters
         if (pFilter !== 'all') filtered = filtered.filter(g => g.platform === pFilter);
@@ -2529,7 +2487,7 @@ class InventoryManager {
 
         // Render
         this.ui.renderGames(filtered);
-        this.ui.renderFeatured(DB.games.filter(g => g.isFeatured));
+        this.ui.renderFeatured(this.games.filter(g => g.isFeatured));
         this.ui.renderPlus(DB.plus);
     }
 
@@ -2545,13 +2503,13 @@ class InventoryManager {
 
         clearBtn.classList.remove('hidden');
         const lowerQ = query.toLowerCase();
-        const results = DB.games.filter(g => g.title.toLowerCase().includes(lowerQ));
+        const results = this.games.filter(g => g.title.toLowerCase().includes(lowerQ));
 
         this.ui.renderSearchResults(results);
     }
 
     addToCart(id, type) {
-        const source = type === 'game' ? DB.games : DB.plus;
+        const source = type === 'game' ? this.games : DB.plus;
         const item = source.find(x => x.id === id);
         
         if (!item) return;
@@ -2811,7 +2769,7 @@ class UIManager {
         }
 
         wishlist.forEach(id => {
-            const item = DB.games.find(g => g.id === id);
+            const item = (this.inventory?.games || []).find(g => g.id === id);
             if(item) {
                 const div = document.createElement('div');
                 div.className = 'cart-item';
@@ -2864,7 +2822,7 @@ class UIManager {
     }
 
     openProductModal(id) {
-        const item = DB.games.find(g => g.id === id);
+        const item = (this.inventory?.games || []).find(g => g.id === id);
         if(!item) return;
 
         this.elems.modalDetails.innerHTML = \`
