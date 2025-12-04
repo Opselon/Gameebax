@@ -234,6 +234,8 @@ async function getDashboardSummary(env) {
         SUM(CASE WHEN active = 0 THEN 1 ELSE 0 END) AS inactive_games,
         SUM(CASE WHEN is_plus = 1 THEN 1 ELSE 0 END) AS plus_games,
         SUM(stock) AS total_stock,
+        SUM(price * stock) AS inventory_value,
+        SUM(CASE WHEN stock <= 3 THEN 1 ELSE 0 END) AS low_stock_games,
         MIN(price) AS min_price,
         MAX(price) AS max_price,
         ROUND(AVG(price), 0) AS avg_price
@@ -244,16 +246,30 @@ async function getDashboardSummary(env) {
     "SELECT id, title, platform, price, stock, active FROM games ORDER BY id DESC LIMIT 6"
   ).all();
 
+  const platformBreakdown = await env.DB.prepare(
+    `SELECT
+      platform,
+      COUNT(*) AS total,
+      SUM(CASE WHEN active = 1 THEN 1 ELSE 0 END) AS active,
+      SUM(stock) AS stock,
+      SUM(CASE WHEN is_plus = 1 THEN 1 ELSE 0 END) AS plus
+    FROM games
+    GROUP BY platform`
+  ).all();
+
   return {
     total_games: aggregate.total_games || 0,
     active_games: aggregate.active_games || 0,
     inactive_games: aggregate.inactive_games || 0,
     plus_games: aggregate.plus_games || 0,
     total_stock: aggregate.total_stock || 0,
+    inventory_value: aggregate.inventory_value || 0,
+    low_stock_games: aggregate.low_stock_games || 0,
     min_price: aggregate.min_price || 0,
     max_price: aggregate.max_price || 0,
     avg_price: aggregate.avg_price || 0,
     recent_games: recent.results || [],
+    platform_breakdown: platformBreakdown.results || [],
   };
 }
 
@@ -537,6 +553,31 @@ function renderAdminDashboard(games, filters = {}, summary = {}) {
         <div class="stat-title">بازه قیمت</div>
         <div class="stat-value">${formatPrice(summary.min_price ?? 0)} - ${formatPrice(summary.max_price ?? 0)}</div>
         <p class="muted" style="margin:4px 0 0 0;">امنیت کوکی فعال است</p>
+      </div>
+      <div class="stat-card">
+        <div class="stat-title">ارزش موجودی</div>
+        <div class="stat-value">${formatPrice(summary.inventory_value ?? 0)}</div>
+        <p class="muted" style="margin:4px 0 0 0;">جمع قیمت × موجودی</p>
+      </div>
+      <div class="stat-card">
+        <div class="stat-title">هشدار موجودی کم</div>
+        <div class="stat-value">${summary.low_stock_games ?? 0}</div>
+        <p class="muted" style="margin:4px 0 0 0;">بازی با موجودی ۳ یا کمتر</p>
+      </div>
+    </div>
+
+    <div class="api-card" style="margin-top:12px;">
+      <div style="display:flex; justify-content:space-between; gap:12px; align-items:center; flex-wrap:wrap;">
+        <div>
+          <div class="chip">پلتفرم‌ها</div>
+          <h3 style="margin:8px 0 4px 0;">سهم بازار بر اساس پلتفرم</h3>
+          <p class="muted" style="margin:0;">نمای کلی بازی‌های PS4 و PS5 بر اساس داده D1</p>
+        </div>
+        <div style="display:flex; gap:6px; flex-wrap:wrap;">${(summary.platform_breakdown || [])
+          .map(
+            (platform) => `<span class="pill">${platform.platform}: ${platform.total} بازی | ${platform.active} فعال | موجودی ${formatPrice(platform.stock)}</span>`
+          )
+          .join("") || '<span class="muted">داده‌ای وجود ندارد</span>'}</div>
       </div>
     </div>
 
