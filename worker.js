@@ -308,6 +308,8 @@ async function restoreGame(env, id) {
 }
 
 async function hardDeleteGame(env, id) {
+  // Cascade: remove variants first so no orphan pricing rows are left behind.
+  await env.DB.prepare("DELETE FROM game_variants WHERE game_id = ?").bind(id).run();
   const stmt = env.DB.prepare("DELETE FROM games WHERE id = ?");
   await stmt.bind(id).run();
 }
@@ -380,9 +382,13 @@ function normalizeGamePayload(data) {
   if (!data.region) throw new Error("Missing required field: region");
 
   const variants = PLATFORM_CAPACITY_MATRIX.map(({ platform, capacity }) => {
-    const price = Number(data[`variant_price_${platform}_${capacity}`]);
+    const rawPrice = data[`variant_price_${platform}_${capacity}`];
+    const price = Number(rawPrice);
     const stock = Number(data[`variant_stock_${platform}_${capacity}`]);
-    const is_active = parseBoolean(data[`variant_active_${platform}_${capacity}`] ?? true);
+    // A variant without a positive price is not for sale: auto-inactivate so it
+    // can never hijack the anchor (cheapest) price with a zero.
+    const hasPrice = rawPrice !== undefined && rawPrice !== "" && !Number.isNaN(price) && price > 0;
+    const is_active = hasPrice ? parseBoolean(data[`variant_active_${platform}_${capacity}`] ?? true) : false;
     return {
       platform,
       capacity,
@@ -520,314 +526,1294 @@ function handleLogout() {
 }
 
 // ============================================================
-// SECTION 4: HTML RENDER HELPERS
+// SECTION 4: HTML RENDER HELPERS (Pro UI Kit)
+// Design system: shared tokens, RTL Persian typography, icons,
+// public storefront shell and admin shell. API-first: every page
+// is rendered from the same service layer that powers /games and
+// /admin/api/* JSON endpoints.
 // ============================================================
 
-function renderLayout(content, { title = "GalaxyZone Admin", metaDescription = CONFIG.DEFAULT_META_DESCRIPTION } = {}) {
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function formatNumber(value) {
+  const num = Number(value ?? 0);
+  if (Number.isNaN(num)) return "۰";
+  return num.toLocaleString("fa-IR");
+}
+
+function escapeJsonLd(value) {
+  return JSON.stringify(value).replace(/</g, "\\u003c");
+}
+
+// --- Inline SVG icon set (stroke-based, inherits currentColor) ---
+const ICONS = {
+  gamepad: `<path d="M6 12h4M8 10v4"/><circle cx="15.5" cy="11" r="0.8" fill="currentColor" stroke="none"/><circle cx="18" cy="13.5" r="0.8" fill="currentColor" stroke="none"/><path d="M17.32 5H6.68a4 4 0 0 0-3.98 3.59c-.24 2.13-.51 4.6-.66 6.36A3 3 0 0 0 5 18.1a3.2 3.2 0 0 0 2.63-1.28l.83-1.13h7.08l.83 1.13A3.2 3.2 0 0 0 19 18.1a3 3 0 0 0 2.96-3.15c-.15-1.76-.42-4.23-.66-6.36A4 4 0 0 0 17.32 5Z"/>`,
+  search: `<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>`,
+  store: `<path d="M4 8.5 6 4h12l2 4.5"/><path d="M4 8.5h16V19a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V8.5Z"/><path d="M9.5 20v-5.5h5V20"/>`,
+  shield: `<path d="M12 3 5 6v5c0 4.5 3 8.4 7 10 4-1.6 7-5.5 7-10V6l-7-3Z"/><path d="m9.5 12 1.8 1.8 3.5-3.7"/>`,
+  star: `<path d="m12 3.5 2.6 5.3 5.9.9-4.3 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8-4.3-4.1 5.9-.9L12 3.5Z"/>`,
+  box: `<path d="M21 8.5v7a2 2 0 0 1-1 1.73l-7 4a2 2 0 0 1-2 0l-7-4A2 2 0 0 1 3 15.5v-7a2 2 0 0 1 1-1.73l7-4a2 2 0 0 1 2 0l7 4a2 2 0 0 1 1 1.73Z"/><path d="m3.3 7.5 8.7 5 8.7-5"/><path d="M12 21.5v-9"/>`,
+  coins: `<ellipse cx="9" cy="7" rx="6" ry="3"/><path d="M3 7v5c0 1.66 2.69 3 6 3s6-1.34 6-3V7"/><path d="M9 15v3c0 1.66 2.69 3 6 3s6-1.34 6-3v-5"/><path d="M15 5.5c3.6.3 6 1.4 6 2.5v5"/>`,
+  wallet: `<path d="M20 8V6.5A1.5 1.5 0 0 0 18.5 5H5a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h13a2 2 0 0 0 2-2v-1"/><path d="M21 8.5h-5a2.5 2.5 0 0 0 0 5h5a.5.5 0 0 0 .5-.5v-4a.5.5 0 0 0-.5-.5Z"/>`,
+  alert: `<path d="M12 4 2.5 20h19L12 4Z"/><path d="M12 10v4.5"/><circle cx="12" cy="17.2" r="0.7" fill="currentColor" stroke="none"/>`,
+  code: `<path d="m8 8-4.5 4L8 16"/><path d="m16 8 4.5 4L16 16"/><path d="m13 5-2.5 14"/>`,
+  pencil: `<path d="M14.5 5.5 18 9"/><path d="M4 20l1-4.5L16.5 4a1.4 1.4 0 0 1 2 0L21 6.5a1.4 1.4 0 0 1 0 2L9.5 20 4 20Z"/>`,
+  trash: `<path d="M4 6h16"/><path d="M9 6V4.5A1.5 1.5 0 0 1 10.5 3h3A1.5 1.5 0 0 1 15 4.5V6"/><path d="M6.5 6 7 19a2 2 0 0 0 2 1.9h6a2 2 0 0 0 2-1.9l.5-13"/><path d="M10 10.5v6M14 10.5v6"/>`,
+  rotate: `<path d="M3.5 8A9.5 9.5 0 1 1 3 13.5"/><path d="M3 3.5V8h4.5"/>`,
+  power: `<path d="M12 3v9"/><path d="M18.4 6.6a9 9 0 1 1-12.8 0"/>`,
+  check: `<path d="m4.5 12.5 5 5L20 7"/>`,
+  plus: `<path d="M12 5v14M5 12h14"/>`,
+  lock: `<rect x="5" y="10.5" width="14" height="10" rx="2"/><path d="M8 10.5V7.5a4 4 0 0 1 8 0v3"/><circle cx="12" cy="15.5" r="1" fill="currentColor" stroke="none"/>`,
+  user: `<circle cx="12" cy="8" r="4"/><path d="M4.5 20.5a7.5 7.5 0 0 1 15 0"/>`,
+  arrow: `<path d="m11 5-7 7 7 7"/><path d="M4 12h16"/>`,
+  zap: `<path d="M13 2 4 14h6l-1 8 9-12h-6l1-8Z"/>`,
+  tag: `<path d="m3 11 9-8h8.5v8.5L12 20a2 2 0 0 1-2.8 0l-6.2-6a2 2 0 0 1 0-3Z"/><circle cx="16" cy="7.5" r="1.2" fill="currentColor" stroke="none"/>`,
+  image: `<rect x="3" y="4.5" width="18" height="15" rx="2.5"/><circle cx="9" cy="10" r="1.8"/><path d="m3.5 17.5 5-5 4 4 3.5-3.5 4.5 4.5"/>`,
+  filter: `<path d="M4 6h16"/><path d="M7 12h10"/><path d="M10 18h4"/>`,
+  chart: `<path d="M4 20V10"/><path d="M10 20V4"/><path d="M16 20v-7"/><path d="M22 20H2"/>`,
+  eye: `<path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12Z"/><circle cx="12" cy="12" r="3"/>`,
+  "eye-off": `<path d="M3 3l18 18"/><path d="M10.6 5.9A9.8 9.8 0 0 1 12 5.5c6 0 9.5 6.5 9.5 6.5a17.5 17.5 0 0 1-2.2 3.1"/><path d="M6.6 6.6A16.8 16.8 0 0 0 2.5 12S6 18.5 12 18.5a9.9 9.9 0 0 0 4.3-1"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/>`,
+  cart: `<circle cx="9" cy="20" r="1.4"/><circle cx="17.5" cy="20" r="1.4"/><path d="M2.5 3.5h3l2.5 12h10l2.5-9H7"/>`,
+  external: `<path d="M14 4h6v6"/><path d="M20 4 11 13"/><path d="M19 14v5a1.5 1.5 0 0 1-1.5 1.5h-12A1.5 1.5 0 0 1 4 19V6.5A1.5 1.5 0 0 1 5.5 5H10"/>`,
+};
+
+function icon(name, size = 20) {
+  const path = ICONS[name] || ICONS.gamepad;
+  return `<svg class="icon" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">${path}</svg>`;
+}
+
+// --- Shared design tokens + primitive styles (public & admin) ---
+const BASE_STYLES = `
+  :root {
+    --bg: #060a17;
+    --bg-soft: #0a1024;
+    --surface: #0e1531;
+    --surface-2: #131c40;
+    --border: #223059;
+    --border-soft: #1a2450;
+    --text: #edf1fd;
+    --text-muted: #97a3c9;
+    --primary: #4f8bff;
+    --accent: #8b5cf6;
+    --cyan: #43e5ff;
+    --success: #2fd571;
+    --warning: #f5a524;
+    --danger: #f04b4b;
+    --plus: #f055b4;
+    --radius-sm: 10px;
+    --radius: 14px;
+    --radius-lg: 20px;
+    --shadow-sm: 0 2px 12px rgba(2, 6, 18, 0.4);
+    --shadow: 0 16px 44px rgba(2, 6, 18, 0.5);
+    --grad-brand: linear-gradient(135deg, #4f8bff 0%, #8b5cf6 55%, #43e5ff 130%);
+    --font: 'Vazirmatn', 'Segoe UI', Tahoma, sans-serif;
+  }
+  *, *::before, *::after { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    font-family: var(--font);
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.75;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    background:
+      radial-gradient(52rem 30rem at 85% -10%, rgba(139, 92, 246, 0.14), transparent 60%),
+      radial-gradient(44rem 28rem at 0% 0%, rgba(79, 139, 255, 0.12), transparent 55%),
+      radial-gradient(40rem 30rem at 50% 120%, rgba(67, 229, 255, 0.07), transparent 60%);
+    pointer-events: none;
+    z-index: 0;
+  }
+  body > * { position: relative; z-index: 1; }
+  img { max-width: 100%; display: block; }
+  a { color: var(--cyan); text-decoration: none; transition: color 0.15s ease; }
+  a:hover { color: #8ceeff; }
+  h1, h2, h3 { line-height: 1.4; margin: 0 0 10px 0; }
+  .container { max-width: 1200px; margin-inline: auto; padding-inline: 18px; }
+  .muted { color: var(--text-muted); font-size: 13px; }
+  .grad-text {
+    background: var(--grad-brand);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+  .icon { flex-shrink: 0; vertical-align: middle; }
+
+  /* Buttons */
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 10px 18px;
+    border-radius: var(--radius-sm);
+    border: 1px solid transparent;
+    background: var(--primary);
+    color: #fff;
+    font-family: var(--font);
+    font-size: 14px;
+    font-weight: 700;
+    cursor: pointer;
+    transition: transform 0.15s ease, box-shadow 0.15s ease, background 0.15s ease, border-color 0.15s ease;
+    white-space: nowrap;
+  }
+  .btn:hover { transform: translateY(-1px); color: #fff; box-shadow: 0 8px 24px rgba(79, 139, 255, 0.35); }
+  .btn:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible {
+    outline: 2px solid var(--cyan);
+    outline-offset: 2px;
+  }
+  .btn--accent { background: var(--accent); }
+  .btn--accent:hover { box-shadow: 0 8px 24px rgba(139, 92, 246, 0.35); }
+  .btn--danger { background: var(--danger); }
+  .btn--danger:hover { box-shadow: 0 8px 24px rgba(240, 75, 75, 0.3); }
+  .btn--ghost {
+    background: rgba(79, 139, 255, 0.08);
+    border-color: rgba(79, 139, 255, 0.4);
+    color: #bcd4ff;
+  }
+  .btn--ghost:hover { background: rgba(79, 139, 255, 0.16); box-shadow: none; color: #dbe8ff; }
+  .btn--danger-ghost {
+    background: rgba(240, 75, 75, 0.08);
+    border-color: rgba(240, 75, 75, 0.35);
+    color: #ffb1b1;
+  }
+  .btn--danger-ghost:hover { background: rgba(240, 75, 75, 0.16); box-shadow: none; color: #ffd3d3; }
+  .btn--sm { padding: 6px 12px; font-size: 12.5px; border-radius: 9px; }
+  .btn--block { width: 100%; }
+  .btn[disabled] { opacity: 0.55; cursor: not-allowed; transform: none; }
+
+  /* Chips & badges */
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 10px;
+    border-radius: 999px;
+    background: rgba(151, 163, 201, 0.1);
+    border: 1px solid rgba(151, 163, 201, 0.22);
+    color: #c6d0ef;
+    font-size: 12px;
+    font-weight: 600;
+    line-height: 1.7;
+  }
+  .chip--platform { background: rgba(67, 229, 255, 0.09); border-color: rgba(67, 229, 255, 0.3); color: #8ceeff; direction: ltr; }
+  .chip--capacity { background: rgba(139, 92, 246, 0.12); border-color: rgba(139, 92, 246, 0.35); color: #cbb6ff; }
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 700;
+    line-height: 1.7;
+  }
+  .badge--success { background: rgba(47, 213, 113, 0.14); border: 1px solid rgba(47, 213, 113, 0.35); color: #7fe9ab; }
+  .badge--danger { background: rgba(240, 75, 75, 0.14); border: 1px solid rgba(240, 75, 75, 0.4); color: #ffa1a1; }
+  .badge--warning { background: rgba(245, 165, 36, 0.13); border: 1px solid rgba(245, 165, 36, 0.4); color: #ffd48a; }
+  .badge--plus {
+    background: linear-gradient(120deg, rgba(240, 85, 180, 0.2), rgba(139, 92, 246, 0.2));
+    border: 1px solid rgba(240, 85, 180, 0.45);
+    color: #ffa8dc;
+  }
+  .badge--ghost { background: rgba(151, 163, 201, 0.08); border: 1px dashed var(--border); color: var(--text-muted); }
+
+  /* Forms */
+  label { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; font-weight: 600; font-size: 13px; color: #c9d3f2; }
+  input, select, textarea {
+    width: 100%;
+    padding: 10px 12px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+    background: rgba(10, 16, 36, 0.8);
+    color: var(--text);
+    font-family: var(--font);
+    font-size: 14px;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  }
+  input::placeholder, textarea::placeholder { color: #5e6c96; }
+  input:focus, select:focus, textarea:focus { border-color: var(--primary); outline: none; box-shadow: 0 0 0 3px rgba(79, 139, 255, 0.18); }
+  input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--primary); cursor: pointer; }
+  textarea { min-height: 90px; resize: vertical; }
+  select { cursor: pointer; }
+  input[dir="ltr"], textarea[dir="ltr"], code { direction: ltr; text-align: left; }
+
+  .alert {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 12px 14px;
+    border-radius: var(--radius-sm);
+    background: rgba(245, 165, 36, 0.08);
+    border: 1px solid rgba(245, 165, 36, 0.35);
+    color: #ffd48a;
+    margin: 12px 0;
+    font-size: 14px;
+  }
+  .alert--error { background: rgba(240, 75, 75, 0.09); border-color: rgba(240, 75, 75, 0.4); color: #ffb1b1; }
+  .divider { border-top: 1px solid var(--border-soft); margin: 16px 0; opacity: 0.7; }
+
+  /* Cards */
+  .card {
+    background: linear-gradient(165deg, var(--surface-2), var(--surface) 65%);
+    border: 1px solid var(--border-soft);
+    border-radius: var(--radius-lg);
+    padding: 20px;
+    box-shadow: var(--shadow-sm);
+  }
+  .card--glow { box-shadow: 0 0 0 1px rgba(79, 139, 255, 0.18), var(--shadow); }
+  .card h3 { margin-top: 0; }
+
+  /* Stat cards */
+  .stat-card {
+    background: linear-gradient(165deg, var(--surface-2), var(--surface) 70%);
+    border: 1px solid var(--border-soft);
+    border-radius: var(--radius);
+    padding: 16px;
+    box-shadow: var(--shadow-sm);
+    position: relative;
+    overflow: hidden;
+  }
+  .stat-card::after {
+    content: "";
+    position: absolute;
+    inset-inline-start: 0;
+    top: 0;
+    bottom: 0;
+    width: 3px;
+    background: var(--grad-brand);
+    opacity: 0.75;
+  }
+  .stat-card__head { display: flex; align-items: center; gap: 8px; color: var(--text-muted); font-size: 12.5px; font-weight: 700; }
+  .stat-card__head .icon { color: var(--primary); }
+  .stat-card__value { font-size: 26px; font-weight: 800; margin-top: 6px; display: flex; align-items: baseline; gap: 6px; }
+  .stat-card__value small { font-size: 13px; font-weight: 600; color: var(--text-muted); }
+  .stat-card__meta { margin: 2px 0 0 0; font-size: 12px; color: var(--text-muted); }
+
+  /* Tables */
+  .table-wrapper {
+    overflow-x: auto;
+    border: 1px solid var(--border-soft);
+    border-radius: var(--radius);
+    background: var(--surface);
+    box-shadow: var(--shadow-sm);
+  }
+  table { width: 100%; border-collapse: collapse; min-width: 720px; }
+  th, td { padding: 12px 14px; text-align: right; font-size: 13.5px; border-bottom: 1px solid var(--border-soft); vertical-align: middle; }
+  thead th {
+    background: rgba(19, 28, 64, 0.9);
+    color: #aeb9dd;
+    font-size: 12px;
+    font-weight: 700;
+    white-space: nowrap;
+    position: sticky;
+    top: 0;
+  }
+  tbody tr { transition: background 0.12s ease; }
+  tbody tr:hover { background: rgba(79, 139, 255, 0.05); }
+  tbody tr:last-child td { border-bottom: none; }
+
+  /* Grids */
+  .grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+  .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; align-items: start; }
+  .full-width { grid-column: 1 / -1; }
+
+  .code-pill {
+    display: block;
+    direction: ltr;
+    text-align: left;
+    background: rgba(2, 6, 18, 0.55);
+    border: 1px solid var(--border-soft);
+    border-radius: 9px;
+    padding: 7px 12px;
+    font-family: "Cascadia Code", Consolas, monospace;
+    font-size: 12.5px;
+    color: #9be8ff;
+    margin-top: 8px;
+  }
+  .method-pill {
+    display: inline-block;
+    direction: ltr;
+    padding: 1px 8px;
+    border-radius: 6px;
+    font-size: 11px;
+    font-weight: 800;
+    font-family: monospace;
+    background: rgba(47, 213, 113, 0.14);
+    border: 1px solid rgba(47, 213, 113, 0.35);
+    color: #7fe9ab;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none !important; transition: none !important; }
+    html { scroll-behavior: auto; }
+  }
+`;
+
+const FONT_LINKS = `
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700;800;900&display=swap" rel="stylesheet" />
+`;
+
+// --- Storefront product card (shared by grid & related section) ---
+function renderGameCard(g) {
+  const variantChips = (g.variants || [])
+    .slice(0, 4)
+    .map(
+      (v) =>
+        `<span class="chip chip--platform">${escapeHtml(v.platform)} · ${formatNumber(v.capacity)} کاربره</span>`
+    )
+    .join("");
+  const extraCount = Math.max((g.variants?.length || 0) - 4, 0);
+  const image = g.image_url
+    ? `<img src="${escapeHtml(g.image_url)}" alt="${escapeHtml(g.title)}" loading="lazy" />`
+    : `<div class="game-card__placeholder">${icon("gamepad", 44)}</div>`;
+  const multiVariant = (g.variants?.length || 0) > 1;
+
+  return `<article class="game-card">
+    <a class="game-card__media" href="/game/${Number(g.id)}" aria-label="${escapeHtml(g.title)}">
+      ${image}
+      ${g.is_plus ? '<span class="badge badge--plus game-card__plus">' + icon("star", 13) + " پلاس</span>" : ""}
+      <span class="chip chip--region game-card__region">${escapeHtml(g.region || "—")}</span>
+    </a>
+    <div class="game-card__body">
+      <h3 class="game-card__title"><a href="/game/${Number(g.id)}">${escapeHtml(g.title)}</a></h3>
+      <div class="game-card__chips">${variantChips}${extraCount > 0 ? `<span class="chip">+${formatNumber(extraCount)}</span>` : ""}</div>
+      ${g.description ? `<p class="game-card__desc">${escapeHtml(truncate(g.description, 90))}</p>` : ""}
+      <div class="game-card__foot">
+        <div class="price">
+          <small>${multiVariant ? "شروع از" : "قیمت"}</small>
+          <strong>${formatPrice(g.price)}</strong>
+          <span class="price__unit">تومان</span>
+        </div>
+        ${g.out_of_stock ? '<span class="badge badge--danger">ناموجود</span>' : '<span class="badge badge--success">موجود</span>'}
+      </div>
+      <a class="btn btn--primary btn--block game-card__cta" href="/game/${Number(g.id)}">
+        ${icon("cart", 17)} مشاهده و خرید
+      </a>
+    </div>
+  </article>`;
+}
+
+// --- Public storefront shell (header, footer, shared public CSS) ---
+function renderPublicShell(inner, { title, metaDescription, ogImage, jsonLd, canonical } = {}) {
+  const ogTags = `
+    <meta property="og:site_name" content="GalaxyZone" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="${escapeHtml(title)}" />
+    <meta property="og:description" content="${escapeHtml(metaDescription || CONFIG.DEFAULT_META_DESCRIPTION)}" />
+    <meta property="og:locale" content="fa_IR" />
+    ${ogImage ? `<meta property="og:image" content="${escapeHtml(ogImage)}" />` : ""}
+    <meta name="twitter:card" content="${ogImage ? "summary_large_image" : "summary"}" />
+    <meta name="theme-color" content="#060a17" />
+    ${canonical ? `<link rel="canonical" href="${escapeHtml(canonical)}" />` : ""}
+  `;
+  const jsonLdBlock = jsonLd
+    ? `<script type="application/ld+json">${escapeJsonLd(jsonLd)}</script>`
+    : "";
+
   return `<!DOCTYPE html>
   <html lang="fa" dir="rtl">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>${title}</title>
-    <meta name="description" content="${metaDescription}" />
+    <title>${escapeHtml(title)}</title>
+    <meta name="description" content="${escapeHtml(metaDescription || CONFIG.DEFAULT_META_DESCRIPTION)}" />
+    ${ogTags}
+    ${FONT_LINKS}
     <style>
-      :root { --primary:#4f8bff; --accent:#8b5cf6; --danger:#ef5350; --surface:#0f142d; --card:#101531; --muted:#9ea7c6; --border:#1f2a55; }
-      * { box-sizing:border-box; }
-      body { font-family: 'Vazirmatn', sans-serif; background:#0b0d1a; color:#e9ecf5; margin:0; padding:0; }
-      header { background:linear-gradient(120deg, #101531, #131a44); padding:12px 20px; display:flex; justify-content:space-between; align-items:center; position:sticky; top:0; z-index:10; box-shadow:0 4px 20px rgba(0,0,0,0.35); }
-      a { color:#6be1ff; text-decoration:none; }
-      table { width:100%; border-collapse:collapse; margin-top:12px; }
-      th, td { border:1px solid var(--border); padding:10px; text-align:right; }
-      th { background:#151a3d; }
-      tr:nth-child(even) { background:#111633; }
-      .container { max-width:1280px; margin:0 auto; padding:16px; }
-      .btn { display:inline-block; padding:10px 14px; background:var(--primary); color:#fff; border-radius:10px; border:none; cursor:pointer; font-weight:700; box-shadow:0 5px 20px rgba(79,139,255,0.35); transition:transform 0.15s ease; }
-      .btn:hover { transform:translateY(-1px); }
-      .btn-secondary { background:var(--accent); box-shadow:0 5px 20px rgba(139,92,246,0.35); }
-      .btn-danger { background:var(--danger); box-shadow:0 5px 20px rgba(239,83,80,0.35); }
-      .btn-ghost { background:transparent; color:#fff; border:1px solid #6be1ff; }
-      form { margin-top:12px; }
-      label { display:flex; flex-direction:column; align-items:flex-start; gap:6px; margin-top:8px; font-weight:700; }
-      input, select, textarea { width:100%; padding:10px; border-radius:10px; border:1px solid #2a335e; background:#0f142d; color:#fff; }
-      textarea { min-height:80px; }
-      .grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(240px, 1fr)); gap:12px; }
-      .form-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(260px, 1fr)); gap:14px; align-items:start; }
-      .form-card { background:var(--card); border:1px solid var(--border); border-radius:14px; padding:14px; box-shadow:0 10px 30px rgba(0,0,0,0.25); }
-      .form-card h3 { margin:0 0 10px 0; }
-      .variant-matrix { display:grid; grid-template-columns:repeat(auto-fit, minmax(260px, 1fr)); gap:12px; }
-      .variant-row { border:1px dashed var(--border); border-radius:12px; padding:10px; background:#0d112a; display:grid; gap:10px; grid-template-columns:repeat(auto-fit, minmax(120px, 1fr)); }
-      .variant-row__title { grid-column:1/-1; display:flex; justify-content:space-between; align-items:center; font-weight:800; }
-      .full-width { grid-column:1/-1; }
-      .badge { display:inline-block; padding:2px 8px; border-radius:8px; background:#2e7d32; color:#fff; font-size:12px; }
-      .badge-ghost { background:rgba(255,255,255,0.06); color:#cfd8ff; border:1px dashed var(--border); }
-      .plus { background:#c2185b; }
-      .muted { color:var(--muted); font-size:12px; }
-      .alert { padding:10px; border-radius:10px; background:#18204a; border:1px solid #2f3d75; margin-top:10px; }
-      .dashboard-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:12px; margin:16px 0; }
-      .stat-card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:14px; box-shadow:0 10px 25px rgba(0,0,0,0.35); }
-      .stat-title { color:var(--muted); font-size:12px; letter-spacing:0.4px; }
-      .stat-value { font-size:26px; font-weight:900; margin-top:6px; display:flex; align-items:center; gap:6px; }
-      .pill { display:inline-block; padding:6px 10px; background:rgba(107,225,255,0.1); border:1px solid #6be1ff33; border-radius:999px; color:#8ae9ff; font-size:12px; }
-      .table-wrapper { overflow:auto; border-radius:12px; border:1px solid var(--border); box-shadow:0 10px 25px rgba(0,0,0,0.4); }
-      .api-card { background:linear-gradient(135deg, #12183a, #0e122c); border:1px solid #1f2a55; padding:16px; border-radius:14px; box-shadow:0 8px 24px rgba(0,0,0,0.35); }
-      .api-card code { background:rgba(255,255,255,0.04); padding:6px 10px; border-radius:8px; display:block; margin-top:8px; direction:ltr; }
-      .chip { display:inline-flex; align-items:center; gap:6px; background:rgba(255,255,255,0.06); padding:6px 10px; border-radius:999px; color:#d5dcff; font-size:12px; }
-      .glow { box-shadow:0 0 0 1px rgba(79,139,255,0.25),0 15px 45px rgba(0,0,0,0.35); }
-      .divider { border-top:1px solid var(--border); margin:14px 0; opacity:0.6; }
+      ${BASE_STYLES}
+      /* ===== Public storefront ===== */
+      .site-header {
+        position: sticky;
+        top: 0;
+        z-index: 50;
+        background: rgba(6, 10, 23, 0.78);
+        backdrop-filter: blur(14px);
+        -webkit-backdrop-filter: blur(14px);
+        border-bottom: 1px solid var(--border-soft);
+      }
+      .site-header__inner { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding-block: 12px; }
+      .brand { display: inline-flex; align-items: center; gap: 10px; color: var(--text); }
+      .brand__mark {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 38px;
+        height: 38px;
+        border-radius: 12px;
+        background: var(--grad-brand);
+        color: #fff;
+        box-shadow: 0 6px 18px rgba(79, 139, 255, 0.4);
+      }
+      .brand__text { font-size: 18px; font-weight: 800; letter-spacing: 0.5px; direction: ltr; }
+      .brand__text b { color: var(--cyan); font-weight: 800; }
+      .site-nav { display: flex; align-items: center; gap: 18px; }
+      .site-nav__link { color: #c9d3f2; font-weight: 600; font-size: 14px; display: inline-flex; align-items: center; gap: 6px; }
+      .site-nav__link:hover { color: #fff; }
+      .site-nav__link.is-active { color: var(--cyan); }
+      @media (max-width: 560px) { .site-nav__link--text { display: none; } }
+
+      .hero { padding: 54px 0 26px; text-align: center; }
+      .hero__eyebrow {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 14px;
+        border-radius: 999px;
+        border: 1px solid rgba(67, 229, 255, 0.3);
+        background: rgba(67, 229, 255, 0.07);
+        color: #8ceeff;
+        font-size: 13px;
+        font-weight: 600;
+      }
+      .hero h1 { font-size: clamp(28px, 5vw, 44px); font-weight: 900; margin: 18px 0 10px; }
+      .hero p { max-width: 620px; margin: 0 auto; color: var(--text-muted); font-size: 15.5px; }
+      .hero__stats {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+        gap: 12px;
+        max-width: 720px;
+        margin: 30px auto 0;
+      }
+      .hero__stat {
+        background: rgba(14, 21, 49, 0.75);
+        border: 1px solid var(--border-soft);
+        border-radius: var(--radius);
+        padding: 14px;
+      }
+      .hero__stat strong { display: block; font-size: 21px; font-weight: 800; }
+      .hero__stat span { font-size: 12px; color: var(--text-muted); }
+
+      .toolbar {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        align-items: flex-end;
+        background: rgba(14, 21, 49, 0.7);
+        border: 1px solid var(--border-soft);
+        border-radius: var(--radius-lg);
+        padding: 16px;
+        margin: 26px 0 22px;
+        box-shadow: var(--shadow-sm);
+      }
+      .toolbar__field { flex: 1 1 170px; }
+      .toolbar__field--grow { flex: 2 1 260px; }
+      .toolbar__actions { display: flex; gap: 8px; }
+
+      .store-grid { display: grid; gap: 18px; grid-template-columns: repeat(auto-fill, minmax(255px, 1fr)); margin-block: 8px 40px; }
+      .game-card {
+        display: flex;
+        flex-direction: column;
+        background: linear-gradient(170deg, var(--surface-2), var(--surface) 60%);
+        border: 1px solid var(--border-soft);
+        border-radius: var(--radius-lg);
+        overflow: hidden;
+        box-shadow: var(--shadow-sm);
+        transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+      }
+      .game-card:hover { transform: translateY(-4px); border-color: rgba(79, 139, 255, 0.45); box-shadow: var(--shadow); }
+      .game-card__media { position: relative; display: block; aspect-ratio: 16 / 9; background: #0a1024; overflow: hidden; }
+      .game-card__media img { width: 100%; height: 100%; object-fit: cover; transition: transform 0.35s ease; }
+      .game-card:hover .game-card__media img { transform: scale(1.05); }
+      .game-card__placeholder {
+        width: 100%;
+        height: 100%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: #2c3a6e;
+        background: radial-gradient(24rem 12rem at 50% 120%, rgba(79, 139, 255, 0.14), transparent 65%);
+      }
+      .game-card__plus { position: absolute; top: 10px; inset-inline-start: 10px; backdrop-filter: blur(6px); }
+      .game-card__region { position: absolute; bottom: 10px; inset-inline-end: 10px; backdrop-filter: blur(6px); background: rgba(6, 10, 23, 0.7); }
+      .game-card__body { display: flex; flex-direction: column; gap: 10px; padding: 14px 16px 16px; flex: 1; }
+      .game-card__title { font-size: 16.5px; font-weight: 800; margin: 0; }
+      .game-card__title a { color: var(--text); }
+      .game-card__title a:hover { color: var(--cyan); }
+      .game-card__chips { display: flex; flex-wrap: wrap; gap: 6px; }
+      .game-card__desc { margin: 0; color: var(--text-muted); font-size: 13px; flex: 1; }
+      .game-card__foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+      .price { display: flex; align-items: baseline; gap: 6px; }
+      .price small { color: var(--text-muted); font-size: 11.5px; }
+      .price strong { font-size: 19px; font-weight: 800; }
+      .price__unit { color: var(--text-muted); font-size: 12px; }
+      .game-card__cta { margin-top: 4px; }
+
+      .empty-state {
+        text-align: center;
+        padding: 70px 20px;
+        border: 1px dashed var(--border);
+        border-radius: var(--radius-lg);
+        background: rgba(14, 21, 49, 0.4);
+        margin-block: 10px 50px;
+      }
+      .empty-state .icon { color: #35437a; }
+      .empty-state h3 { margin: 12px 0 4px; }
+
+      /* Detail page */
+      .breadcrumb { display: flex; align-items: center; gap: 8px; padding: 20px 0 0; font-size: 13px; color: var(--text-muted); flex-wrap: wrap; }
+      .detail { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 6fr); gap: 26px; margin: 18px 0 30px; align-items: start; }
+      @media (max-width: 820px) { .detail { grid-template-columns: 1fr; } }
+      .detail__media {
+        position: relative;
+        border-radius: var(--radius-lg);
+        overflow: hidden;
+        border: 1px solid var(--border-soft);
+        aspect-ratio: 16 / 10;
+        background: #0a1024;
+        box-shadow: var(--shadow);
+      }
+      .detail__media img { width: 100%; height: 100%; object-fit: cover; }
+      .detail__media .game-card__placeholder { height: 100%; }
+      .detail__badges { position: absolute; top: 12px; inset-inline-start: 12px; display: flex; gap: 8px; }
+      .detail__info h1 { font-size: clamp(24px, 4vw, 34px); font-weight: 900; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+      .detail__chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+      .detail__desc { color: #c9d3f2; font-size: 15px; white-space: pre-line; }
+      .detail__price {
+        display: flex;
+        align-items: baseline;
+        gap: 8px;
+        margin: 18px 0;
+        padding: 14px 18px;
+        border-radius: var(--radius);
+        background: rgba(79, 139, 255, 0.07);
+        border: 1px solid rgba(79, 139, 255, 0.25);
+      }
+      .detail__price small { color: var(--text-muted); }
+      .detail__price strong { font-size: 30px; font-weight: 900; background: var(--grad-brand); -webkit-background-clip: text; background-clip: text; color: transparent; }
+      .detail__price span { color: var(--text-muted); font-size: 13px; }
+      .detail__cta { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 20px; }
+      .trust-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin: 0; padding: 0; list-style: none; }
+      .trust-list li {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 13px;
+        color: #c9d3f2;
+        background: rgba(14, 21, 49, 0.6);
+        border: 1px solid var(--border-soft);
+        border-radius: var(--radius-sm);
+        padding: 9px 12px;
+      }
+      .trust-list .icon { color: var(--success); }
+      .tag-list { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 18px; }
+      .tag {
+        display: inline-block;
+        padding: 3px 11px;
+        background: rgba(14, 21, 49, 0.8);
+        border: 1px solid var(--border-soft);
+        border-radius: 999px;
+        font-size: 12px;
+        color: var(--text-muted);
+      }
+
+      .section-title { display: flex; align-items: center; gap: 10px; margin: 34px 0 16px; font-size: 19px; font-weight: 800; }
+      .section-title .icon { color: var(--primary); }
+      .variants-table { min-width: 640px; }
+      .price--old { color: var(--text-muted); text-decoration: line-through; font-size: 12.5px; margin-inline-start: 8px; }
+      .related-grid { display: grid; gap: 18px; grid-template-columns: repeat(auto-fill, minmax(255px, 1fr)); margin-bottom: 46px; }
+
+      .site-footer { border-top: 1px solid var(--border-soft); background: rgba(6, 10, 23, 0.7); margin-top: 30px; }
+      .site-footer__inner {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        flex-wrap: wrap;
+        padding-block: 20px;
+        color: var(--text-muted);
+        font-size: 13px;
+      }
+      .site-footer__links { display: flex; align-items: center; gap: 16px; }
+    </style>
+    ${jsonLdBlock}
+  </head>
+  <body>
+    <header class="site-header">
+      <div class="container site-header__inner">
+        <a class="brand" href="/store">
+          <span class="brand__mark">${icon("gamepad", 21)}</span>
+          <span class="brand__text">GALAXY<b>ZONE</b></span>
+        </a>
+        <nav class="site-nav" aria-label="ناوبری اصلی">
+          <a class="site-nav__link is-active" href="/store">${icon("store", 17)}<span class="site-nav__link--text">فروشگاه</span></a>
+          <a class="site-nav__link" href="/games" title="REST API"><span class="site-nav__link--text">API</span>${icon("code", 17)}</a>
+          <a class="btn btn--ghost btn--sm" href="/admin/login">${icon("user", 15)} ورود مدیر</a>
+        </nav>
+      </div>
+    </header>
+    <main>${inner}</main>
+    <footer class="site-footer">
+      <div class="container site-footer__inner">
+        <div>${icon("shield", 15)} GalaxyZone — فروشگاه اکانت و بازی‌های PS4 / PS5 با تحویل فوری و ضمانت</div>
+        <div class="site-footer__links">
+          <a href="/games">API فروشگاه</a>
+          <a href="/store">همه بازی‌ها</a>
+        </div>
+      </div>
+    </footer>
+  </body>
+  </html>`;
+}
+
+function renderStorefront(games, filters = {}, origin = "") {
+  const activeVariants = games.reduce((acc, g) => acc + (g.variants?.length || 0), 0);
+  const pricePoints = games.map((g) => Number(g.price) || 0).filter((p) => p > 0);
+  const minPrice = pricePoints.length ? Math.min(...pricePoints) : 0;
+  const titleSuffix = filters.platform ? ` ${filters.platform}` : "";
+  const pageTitle = `فروشگاه بازی${titleSuffix} | GalaxyZone`;
+
+  const filterToolbar = `
+    <form class="toolbar" method="GET" action="/store" role="search" aria-label="فیلتر بازی‌ها">
+      <div class="toolbar__field toolbar__field--grow">
+        <label for="f-title">جستجو</label>
+        <input id="f-title" type="search" name="title" value="${escapeHtml(filters.title || "")}" placeholder="نام بازی… مثلاً God of War" />
+      </div>
+      <div class="toolbar__field">
+        <label for="f-platform">پلتفرم</label>
+        <select id="f-platform" name="platform">
+          <option value="">همه</option>
+          <option value="PS4" ${filters.platform === "PS4" ? "selected" : ""}>PS4</option>
+          <option value="PS5" ${filters.platform === "PS5" ? "selected" : ""}>PS5</option>
+        </select>
+      </div>
+      <div class="toolbar__field">
+        <label for="f-capacity">ظرفیت اکانت</label>
+        <select id="f-capacity" name="capacity">
+          <option value="">همه</option>
+          <option value="1" ${filters.capacity === "1" ? "selected" : ""}>۱ کاربره</option>
+          <option value="2" ${filters.capacity === "2" ? "selected" : ""}>۲ کاربره</option>
+          <option value="3" ${filters.capacity === "3" ? "selected" : ""}>۳ کاربره</option>
+        </select>
+      </div>
+      <div class="toolbar__field">
+        <label for="f-plus">نوع</label>
+        <select id="f-plus" name="is_plus">
+          <option value="">همه</option>
+          <option value="1" ${filters.is_plus === "1" ? "selected" : ""}>فقط پلاس</option>
+          <option value="0" ${filters.is_plus === "0" ? "selected" : ""}>بدون پلاس</option>
+        </select>
+      </div>
+      <div class="toolbar__actions">
+        <button class="btn" type="submit">${icon("filter", 16)} اعمال فیلتر</button>
+        <a class="btn btn--ghost" href="/store">حذف فیلترها</a>
+      </div>
+    </form>`;
+
+  const cardsGrid = games.length
+    ? `<div class="store-grid">${games.map(renderGameCard).join("")}</div>`
+    : `<div class="empty-state">
+        ${icon("search", 46)}
+        <h3>موردی مطابق فیلترها پیدا نشد</h3>
+        <p class="muted">فیلترها را تغییر دهید یا همه بازی‌ها را ببینید.</p>
+        <a class="btn btn--ghost" href="/store" style="margin-top:12px;">نمایش همه بازی‌ها</a>
+      </div>`;
+
+  const inner = `
+    <section class="hero">
+      <div class="container">
+        <span class="hero__eyebrow">${icon("zap", 15)} تحویل فوری · ضمانت بازگشت وجه · پشتیبانی مستقیم</span>
+        <h1>فروشگاه <span class="grad-text">اکانت و بازی</span> PS4 / PS5</h1>
+        <p>اکانت‌های قانونی با گارانتی، گیفت‌کارت پلاس و بازی‌های دیجیتال — قیمت شفاف برای هر پلتفرم و هر ظرفیت.</p>
+        <div class="hero__stats">
+          <div class="hero__stat"><strong>${formatNumber(games.length)}</strong><span>عنوان فعال</span></div>
+          <div class="hero__stat"><strong>${formatNumber(activeVariants)}</strong><span>واریانت قابل خرید</span></div>
+          <div class="hero__stat"><strong>${minPrice ? formatPrice(minPrice) : "—"}</strong><span>شروع قیمت (تومان)</span></div>
+        </div>
+      </div>
+    </section>
+    <div class="container">
+      ${filterToolbar}
+      ${cardsGrid}
+    </div>`;
+
+  return renderPublicShell(inner, {
+    title: pageTitle,
+    metaDescription: CONFIG.DEFAULT_META_DESCRIPTION,
+    canonical: origin ? `${origin}/store` : "",
+  });
+}
+
+function renderGameDetail(game, related = [], origin = "") {
+  const variants = game.variants || [];
+  const availableVariants = variants.filter((v) => Number(v.stock) > 0);
+  const pricePoints = variants.map((v) => Number(v.price) || 0).filter((p) => p > 0);
+  const minPrice = pricePoints.length ? Math.min(...pricePoints) : Number(game.price) || 0;
+  const maxPrice = pricePoints.length ? Math.max(...pricePoints) : minPrice;
+  const tags = (game.seo_tags || "").split(",").map((t) => t.trim()).filter(Boolean);
+
+  const variantRows = variants
+    .map((v) => {
+      const outOfStock = Number(v.stock) <= 0;
+      return `<tr>
+        <td><span class="chip chip--platform">${escapeHtml(v.platform)}</span></td>
+        <td><span class="chip chip--capacity">${formatNumber(v.capacity)} کاربره</span></td>
+        <td>
+          <strong>${formatPrice(v.price)}</strong> <span class="muted">تومان</span>
+          ${v.old_price && Number(v.old_price) > Number(v.price) ? `<span class="price--old">${formatPrice(v.old_price)}</span>` : ""}
+        </td>
+        <td>${formatNumber(v.stock)}</td>
+        <td>${outOfStock ? '<span class="badge badge--danger">ناموجود</span>' : '<span class="badge badge--success">آماده تحویل</span>'}</td>
+      </tr>`;
+    })
+    .join("");
+
+  const jsonLd = {
+    "@context": "https://schema.org",
+    "@type": "Product",
+    name: game.title,
+    description: (game.seo_description || game.description || CONFIG.DEFAULT_META_DESCRIPTION).slice(0, 300),
+    ...(game.image_url ? { image: [game.image_url] } : {}),
+    brand: { "@type": "Brand", name: "GalaxyZone" },
+    sku: `GZ-${game.id}`,
+    offers: {
+      "@type": "AggregateOffer",
+      priceCurrency: "IRR",
+      lowPrice: minPrice,
+      highPrice: maxPrice || minPrice,
+      offerCount: variants.length || 1,
+      availability: availableVariants.length
+        ? "https://schema.org/InStock"
+        : "https://schema.org/OutOfStock",
+    },
+  };
+
+  const inner = `
+    <div class="container">
+      <nav class="breadcrumb" aria-label="مسیر صفحه">
+        <a href="/store">فروشگاه</a>
+        ${icon("arrow", 14)}
+        <span>${escapeHtml(game.title)}</span>
+      </nav>
+
+      <div class="detail">
+        <div class="detail__media">
+          ${game.image_url
+            ? `<img src="${escapeHtml(game.image_url)}" alt="${escapeHtml(game.title)}" />`
+            : `<div class="game-card__placeholder">${icon("gamepad", 56)}</div>`}
+          <div class="detail__badges">
+            ${game.is_plus ? '<span class="badge badge--plus">' + icon("star", 13) + " پلاس</span>" : ""}
+            ${game.out_of_stock ? '<span class="badge badge--danger">ناموجود</span>' : '<span class="badge badge--success">موجود</span>'}
+          </div>
+        </div>
+        <div class="detail__info">
+          <h1>${escapeHtml(game.title)}${game.is_plus ? '<span class="badge badge--plus">' + icon("star", 13) + " پلاس</span>" : ""}</h1>
+          <div class="detail__chips">
+            <span class="chip chip--region">${icon("store", 13)} ریجن ${escapeHtml(game.region || "—")}</span>
+            <span class="chip">${icon("box", 13)} ${formatNumber(game.stock || 0)} عدد موجودی کل</span>
+          </div>
+          ${game.description ? `<p class="detail__desc">${escapeHtml(game.description)}</p>` : '<p class="muted">توضیحاتی برای این محصول ثبت نشده است.</p>'}
+          <div class="detail__price">
+            <small>شروع قیمت</small>
+            <strong>${formatPrice(minPrice)}</strong>
+            <span>تومان${variants.length > 1 ? ` (تا ${formatPrice(maxPrice)} بسته به پلتفرم و ظرفیت)` : ""}</span>
+          </div>
+          <div class="detail__cta">
+            ${availableVariants.length
+              ? `<a class="btn btn--primary" href="#variants">${icon("cart", 17)} انتخاب واریانت و خرید</a>`
+              : '<span class="btn" style="opacity:0.55; cursor:not-allowed;" aria-disabled="true">به‌زودی — موجود نیست</span>'}
+            <a class="btn btn--ghost" href="/store">${icon("arrow", 16)} بازگشت به فروشگاه</a>
+          </div>
+          <ul class="trust-list">
+            <li>${icon("zap", 15)} تحویل آنی پس از پرداخت</li>
+            <li>${icon("shield", 15)} گارانتی مادام‌العمر</li>
+            <li>${icon("user", 15)} پشتیبانی مستقیم</li>
+          </ul>
+          ${tags.length ? `<div class="tag-list">${tags.map((t) => `<span class="tag">${escapeHtml(t)}</span>`).join("")}</div>` : ""}
+        </div>
+      </div>
+
+      <h2 class="section-title" id="variants">${icon("tag", 20)} جدول قیمت واریانت‌ها</h2>
+      ${variants.length
+        ? `<div class="table-wrapper">
+            <table class="variants-table">
+              <thead>
+                <tr><th scope="col">پلتفرم</th><th scope="col">ظرفیت</th><th scope="col">قیمت</th><th scope="col">موجودی</th><th scope="col">وضعیت</th></tr>
+              </thead>
+              <tbody>${variantRows}</tbody>
+            </table>
+          </div>`
+        : '<p class="muted">هنوز واریانتی برای این محصول ثبت نشده است.</p>'}
+      ${
+        related.length
+          ? `<h2 class="section-title">${icon("gamepad", 20)} بازی‌های مشابه</h2>
+             <div class="related-grid">${related.map(renderGameCard).join("")}</div>`
+          : ""
+      }
+    </div>`;
+
+  return renderPublicShell(inner, {
+    title: game.seo_title || game.title,
+    metaDescription: truncate(game.seo_description || game.description || CONFIG.DEFAULT_META_DESCRIPTION, 160),
+    ogImage: game.image_url || undefined,
+    jsonLd,
+    canonical: origin ? `${origin}/game/${Number(game.id)}` : "",
+  });
+}
+
+// --- Admin shell ---
+function renderAdminShell(content, { title = "GalaxyZone Admin", activeNav = "", script = "" } = {}) {
+  const navLink = (href, label, key, iconName) =>
+    `<a class="admin-nav__link ${activeNav === key ? "is-active" : ""}" href="${href}">${icon(iconName, 16)} ${label}</a>`;
+
+  return `<!DOCTYPE html>
+  <html lang="fa" dir="rtl">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>${escapeHtml(title)}</title>
+    <meta name="description" content="پنل مدیریت GalaxyZone" />
+    <meta name="robots" content="noindex, nofollow" />
+    <meta name="theme-color" content="#060a17" />
+    ${FONT_LINKS}
+    <style>
+      ${BASE_STYLES}
+      /* ===== Admin panel ===== */
+      body { background: var(--bg); }
+      .admin-header {
+        position: sticky;
+        top: 0;
+        z-index: 50;
+        background: rgba(6, 10, 23, 0.82);
+        backdrop-filter: blur(14px);
+        -webkit-backdrop-filter: blur(14px);
+        border-bottom: 1px solid var(--border-soft);
+      }
+      .admin-header__inner { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-block: 11px; flex-wrap: wrap; }
+      .brand { display: inline-flex; align-items: center; gap: 10px; color: var(--text); }
+      .brand__mark {
+        display: inline-flex; align-items: center; justify-content: center;
+        width: 34px; height: 34px; border-radius: 11px;
+        background: var(--grad-brand); color: #fff;
+        box-shadow: 0 6px 16px rgba(79, 139, 255, 0.35);
+      }
+      .brand__text { font-size: 15.5px; font-weight: 800; direction: ltr; }
+      .brand__text b { color: var(--cyan); }
+      .brand__env { font-size: 11px; color: var(--text-muted); border: 1px solid var(--border-soft); border-radius: 6px; padding: 1px 8px; }
+      .admin-nav { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+      .admin-nav__link {
+        display: inline-flex; align-items: center; gap: 7px;
+        padding: 7px 13px; border-radius: 10px;
+        color: #c9d3f2; font-size: 13.5px; font-weight: 600;
+      }
+      .admin-nav__link:hover { color: #fff; background: rgba(79, 139, 255, 0.1); }
+      .admin-nav__link.is-active { color: #dbe8ff; background: rgba(79, 139, 255, 0.16); box-shadow: inset 0 0 0 1px rgba(79, 139, 255, 0.35); }
+      .admin-main { padding-block: 26px 50px; }
+      .admin-footer { border-top: 1px solid var(--border-soft); padding-block: 16px; text-align: center; color: var(--text-muted); font-size: 12.5px; }
+      .page-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 14px; flex-wrap: wrap; margin-bottom: 22px; }
+      .page-head h1 { font-size: 24px; font-weight: 900; margin: 0; }
+      .page-head__sub { color: var(--text-muted); font-size: 13.5px; margin-top: 4px; }
+      .page-head__actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+
+      .stats-grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(172px, 1fr)); margin-bottom: 18px; }
+
+      .platform-row { display: grid; grid-template-columns: 70px 1fr auto; align-items: center; gap: 12px; margin-top: 12px; }
+      .platform-row__bar { height: 9px; border-radius: 999px; background: rgba(151, 163, 201, 0.12); overflow: hidden; }
+      .platform-row__fill { height: 100%; border-radius: 999px; background: var(--grad-brand); }
+      .api-row { display: flex; align-items: center; gap: 10px; margin-top: 10px; flex-wrap: wrap; }
+      .api-row code { flex: 1; min-width: 200px; }
+
+      .toolbar-form { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; }
+      .toolbar-form > div { flex: 1 1 170px; }
+      .toolbar-form__actions { display: flex; gap: 8px; }
+
+      .actions-cell { display: flex; gap: 6px; flex-wrap: wrap; }
+      .actions-cell form { display: inline-flex; }
+      .game-cell { display: flex; align-items: center; gap: 10px; min-width: 190px; }
+      .game-cell__thumb {
+        width: 44px; height: 44px; border-radius: 10px; overflow: hidden; flex-shrink: 0;
+        background: var(--surface-2); border: 1px solid var(--border-soft);
+        display: flex; align-items: center; justify-content: center; color: #35437a;
+      }
+      .game-cell__thumb img { width: 100%; height: 100%; object-fit: cover; }
+      .game-cell__title { font-weight: 700; font-size: 13.5px; color: var(--text); }
+      .game-cell__meta { font-size: 11.5px; color: var(--text-muted); display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+      .variant-chips { display: flex; flex-wrap: wrap; gap: 5px; max-width: 300px; }
+      .variant-chips .chip { font-size: 11px; padding: 2px 8px; }
+      .result-count { display: inline-flex; align-items: center; gap: 6px; margin: 14px 0 10px; }
+
+      .form-actions {
+        position: sticky;
+        bottom: 0;
+        z-index: 40;
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+        align-items: center;
+        padding: 14px 18px;
+        margin-top: 20px;
+        background: rgba(10, 16, 36, 0.85);
+        backdrop-filter: blur(12px);
+        -webkit-backdrop-filter: blur(12px);
+        border: 1px solid var(--border-soft);
+        border-radius: var(--radius-lg);
+        box-shadow: var(--shadow);
+      }
+
+      .variant-card {
+        border: 1px solid var(--border-soft);
+        border-radius: var(--radius);
+        background: rgba(10, 16, 36, 0.6);
+        padding: 13px;
+        display: grid;
+        gap: 10px;
+        transition: opacity 0.2s ease, border-color 0.2s ease;
+      }
+      .variant-card.is-off { opacity: 0.55; border-style: dashed; }
+      .variant-card__head { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-weight: 800; font-size: 13.5px; }
+      .variant-card__head .chips { display: flex; gap: 6px; }
+      .variant-card__toggle { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; color: var(--text-muted); cursor: pointer; flex-direction: row; font-weight: 600; }
+      .image-preview {
+        margin-top: 10px;
+        border: 1px dashed var(--border);
+        border-radius: var(--radius);
+        min-height: 120px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        overflow: hidden;
+        color: #35437a;
+        background: rgba(10, 16, 36, 0.6);
+      }
+      .image-preview img { max-height: 220px; width: 100%; object-fit: contain; }
     </style>
   </head>
   <body>
-    <header>
-      <div><strong>GalaxyZone Admin</strong></div>
-      <nav>
-        <a href="/admin" style="margin-left:10px;">داشبورد</a>
-        <form method="POST" action="/admin/logout" style="display:inline;">
-          <button class="btn btn-ghost" type="submit">خروج</button>
-        </form>
-      </nav>
+    <header class="admin-header">
+      <div class="container admin-header__inner">
+        <div class="brand">
+          <span class="brand__mark">${icon("shield", 18)}</span>
+          <span class="brand__text">GALAXY<b>ZONE</b></span>
+          <span class="brand__env">پنل مدیریت</span>
+        </div>
+        <nav class="admin-nav" aria-label="ناوبری مدیریت">
+          ${navLink("/admin", "داشبورد", "dashboard", "gamepad")}
+          ${navLink("/admin/games/new", "بازی جدید", "new", "plus")}
+          ${navLink("/store", "فروشگاه", "store", "store")}
+          <form method="POST" action="/admin/logout" style="display:inline-flex;">
+            <button class="btn btn--danger-ghost btn--sm" type="submit">${icon("power", 15)} خروج</button>
+          </form>
+        </nav>
+      </div>
     </header>
-    <div class="container">${content}</div>
+    <main class="container admin-main">${content}</main>
+    <footer class="admin-footer">GalaxyZone Admin · API-first · داده‌ها از Cloudflare D1</footer>
+    ${script ? `<script>${script}</script>` : ""}
   </body>
   </html>`;
 }
 
 function renderAdminLoginPage(errorMessage = "") {
-  const errorBlock = errorMessage ? `<div class="alert">${errorMessage}</div>` : "";
+  const errorBlock = errorMessage
+    ? `<div class="alert alert--error" role="alert">${icon("alert", 18)} ${escapeHtml(errorMessage)}</div>`
+    : "";
   return `<!DOCTYPE html>
   <html lang="fa" dir="rtl">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>ورود ادمین</title>
+    <title>ورود مدیر | GalaxyZone</title>
+    <meta name="robots" content="noindex, nofollow" />
+    <meta name="theme-color" content="#060a17" />
+    ${FONT_LINKS}
     <style>
-      body { font-family: 'Vazirmatn', sans-serif; background:#0b0d1a; color:#e9ecf5; display:flex; align-items:center; justify-content:center; height:100vh; margin:0; }
-      .card { background:#101531; padding:24px; border-radius:12px; width:320px; box-shadow:0 10px 40px rgba(0,0,0,0.4); }
-      label { display:block; margin-top:12px; }
-      input { width:100%; padding:10px; margin-top:6px; border-radius:8px; border:1px solid #1f2a55; background:#0f142d; color:#fff; }
-      button { width:100%; padding:12px; margin-top:16px; border:none; border-radius:8px; background:#1e88e5; color:#fff; cursor:pointer; }
-      .muted { color:#9ea7c6; font-size:12px; }
-      .alert { padding:10px; border-radius:8px; background:#18204a; border:1px solid #2f3d75; margin-top:10px; }
+      ${BASE_STYLES}
+      body { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; }
+      .login-card {
+        width: 100%;
+        max-width: 400px;
+        background: linear-gradient(165deg, var(--surface-2), var(--surface) 70%);
+        border: 1px solid var(--border-soft);
+        border-radius: var(--radius-lg);
+        padding: 34px 30px;
+        box-shadow: var(--shadow);
+      }
+      .login-card__brand { display: flex; flex-direction: column; align-items: center; gap: 12px; margin-bottom: 24px; text-align: center; }
+      .login-card__brand .brand__mark { width: 56px; height: 56px; border-radius: 18px; box-shadow: 0 10px 30px rgba(79, 139, 255, 0.45); }
+      .login-card__brand h1 { font-size: 19px; font-weight: 800; margin: 0; }
+      .login-card__brand p { margin: 0; color: var(--text-muted); font-size: 12.5px; }
+      .field { margin-bottom: 15px; }
+      .input-wrap { position: relative; }
+      .input-wrap .icon { position: absolute; inset-inline-start: 12px; top: 50%; transform: translateY(-50%); color: #5e6c96; pointer-events: none; }
+      .input-wrap input { padding-inline-start: 40px; }
+      .input-wrap--toggle input { padding-inline-end: 44px; }
+      .toggle-pass {
+        position: absolute; inset-inline-end: 8px; top: 50%; transform: translateY(-50%);
+        background: none; border: none; color: var(--text-muted); cursor: pointer;
+        display: inline-flex; padding: 6px; border-radius: 8px;
+      }
+      .toggle-pass:hover { color: #fff; background: rgba(79, 139, 255, 0.12); }
+      .login-card__submit { width: 100%; margin-top: 8px; padding-block: 12px; font-size: 15px; }
+      .login-card__foot { text-align: center; margin-top: 20px; font-size: 12px; color: var(--text-muted); }
+      .login-card__foot a { display: inline-flex; align-items: center; gap: 6px; margin-top: 8px; }
     </style>
   </head>
   <body>
-    <div class="card">
-      <h2>ورود مدیریت</h2>
+    <main class="login-card">
+      <div class="login-card__brand">
+        <span class="brand__mark">${icon("shield", 26)}</span>
+        <h1>ورود به پنل مدیریت</h1>
+        <p>GalaxyZone · دسترسی فقط برای مدیران مجاز است</p>
+      </div>
       ${errorBlock}
-      <form method="POST" action="/admin/login">
-        <label>نام کاربری
-          <input required name="username" />
-        </label>
-        <label>رمز عبور
-          <input required name="password" type="password" />
-        </label>
-        <button type="submit">ورود</button>
-        <p class="muted">یوزرنیم: ${CONFIG.ADMIN_USERNAME} | پسورد: ${CONFIG.ADMIN_PASSWORD}</p>
+      <form method="POST" action="/admin/login" autocomplete="on">
+        <div class="field">
+          <label for="username">نام کاربری</label>
+          <div class="input-wrap">
+            ${icon("user", 17)}
+            <input id="username" name="username" required autocomplete="username" placeholder="نام کاربری مدیر" />
+          </div>
+        </div>
+        <div class="field">
+          <label for="password">رمز عبور</label>
+          <div class="input-wrap input-wrap--toggle">
+            ${icon("lock", 17)}
+            <input id="password" name="password" type="password" required autocomplete="current-password" placeholder="••••••••" />
+            <button class="toggle-pass" type="button" id="togglePass" aria-label="نمایش/پنهان‌سازی رمز">${icon("eye", 17)}</button>
+          </div>
+        </div>
+        <button class="btn login-card__submit" type="submit">${icon("power", 17)} ورود به داشبورد</button>
       </form>
-    </div>
+      <div class="login-card__foot">
+        <a href="/store">${icon("arrow", 14)} بازگشت به فروشگاه</a>
+      </div>
+    </main>
+    <script>
+      (function () {
+        var btn = document.getElementById("togglePass");
+        var input = document.getElementById("password");
+        var show = '${icon("eye", 17)}';
+        var hide = '${icon("eye-off", 17)}';
+        btn.addEventListener("click", function () {
+          var visible = input.type === "text";
+          input.type = visible ? "password" : "text";
+          btn.innerHTML = visible ? show : hide;
+          btn.setAttribute("aria-label", visible ? "نمایش رمز" : "پنهان‌سازی رمز");
+        });
+      })();
+    </script>
   </body>
   </html>`;
 }
 
 function renderAdminDashboard(games, filters = {}, summary = {}) {
   const rows = games
-    .map(
-      (g) => {
-        const variantDetails = (g.variants || [])
-          .map(
-            (v) => `<div class="chip">
-              ${v.platform.toUpperCase()} | ظرفیت ${v.capacity} | ${formatPrice(v.price)} تومان
-              <span class="muted">موجودی: ${v.stock}</span>
-              ${!v.is_active ? '<span class="badge-ghost">غیرفعال</span>' : ''}
-            </div>`
-          )
-          .join("") || "-";
-        return `<tr>
-          <td>${g.id}</td>
-          <td>${g.title}</td>
-          <td>${g.region}</td>
-          <td>${g.is_plus ? '<span class="badge plus">+Plus</span>' : '-'}</td>
-          <td>${variantDetails}</td>
-          <td>${formatPrice(g.price)}</td>
-          <td>${g.stock}</td>
-          <td>${g.active ? '<span class="badge">فعال</span>' : '<span class="badge" style="background:#c62828;">غیرفعال</span>'}</td>
-          <td>${g.image_url ? '<a href="' + g.image_url + '" target="_blank">لینک</a>' : '-'}</td>
-          <td>${truncate(g.description, 50)}</td>
-          <td>${g.seo_title || '-'}</td>
-          <td>${truncate(g.seo_description, 60)}</td>
-          <td>${g.seo_tags || '-'}</td>
-          <td>
-            <a class="btn btn-secondary" href="/admin/games/${g.id}">ویرایش</a>
-            <form method="POST" action="/admin/games/${g.id}/delete" style="display:inline;" onsubmit="return confirm('بازی غیرفعال می‌شود. ادامه می‌دهید؟');">
-              <button class="btn btn-danger" type="submit">حذف نرم</button>
+    .map((g) => {
+      const variantChips = (g.variants || [])
+        .map(
+          (v) => `<span class="chip chip--platform">${escapeHtml(v.platform)}·${formatNumber(v.capacity)} · ${formatPrice(v.price)}${!v.is_active ? " · خاموش" : ""}</span>`
+        )
+        .join("") || '<span class="muted">—</span>';
+      const toggleForm = `
+        <form method="POST" action="/admin/games/${Number(g.id)}" title="${g.active ? "غیرفعال‌سازی" : "فعال‌سازی"}">
+          <input type="hidden" name="title" value="${escapeHtml(g.title)}" />
+          <input type="hidden" name="platform" value="${escapeHtml(g.platform || "")}" />
+          <input type="hidden" name="region" value="${escapeHtml(g.region || "")}" />
+          <input type="hidden" name="capacity" value="${Number(g.capacity || 0)}" />
+          <input type="hidden" name="is_plus" value="${g.is_plus ? 1 : 0}" />
+          <input type="hidden" name="price" value="${Number(g.price || 0)}" />
+          <input type="hidden" name="stock" value="${Number(g.stock || 0)}" />
+          <input type="hidden" name="active" value="${g.active ? 0 : 1}" />
+          <input type="hidden" name="image_url" value="${escapeHtml(g.image_url || "")}" />
+          <input type="hidden" name="description" value="${escapeHtml(g.description || "")}" />
+          <input type="hidden" name="seo_title" value="${escapeHtml(g.seo_title || "")}" />
+          <input type="hidden" name="seo_description" value="${escapeHtml(g.seo_description || "")}" />
+          <input type="hidden" name="seo_tags" value="${escapeHtml(g.seo_tags || "")}" />
+          <button class="btn btn--ghost btn--sm" type="submit" title="${g.active ? "غیرفعال‌سازی" : "فعال‌سازی"}">${icon(g.active ? "power" : "check", 15)}</button>
+        </form>`;
+      return `<tr>
+        <td class="muted" dir="ltr">${Number(g.id)}</td>
+        <td>
+          <div class="game-cell">
+            <span class="game-cell__thumb">${g.image_url ? `<img src="${escapeHtml(g.image_url)}" alt="" loading="lazy" />` : icon("gamepad", 20)}</span>
+            <span>
+              <span class="game-cell__title">${escapeHtml(g.title)}</span>
+              <span class="game-cell__meta">${escapeHtml(g.region || "—")}${g.is_plus ? ' · <span class="badge badge--plus" style="font-size:10px; padding:0 7px;">پلاس</span>' : ""}</span>
+            </span>
+          </div>
+        </td>
+        <td><div class="variant-chips">${variantChips}</div></td>
+        <td><strong>${formatPrice(g.price)}</strong> <span class="muted">تومان</span></td>
+        <td>${formatNumber(g.stock)}</td>
+        <td>${g.active ? '<span class="badge badge--success">فعال</span>' : '<span class="badge badge--danger">غیرفعال</span>'}</td>
+        <td>
+          <div class="actions-cell">
+            <a class="btn btn--ghost btn--sm" href="/admin/games/${Number(g.id)}" title="ویرایش">${icon("pencil", 15)}</a>
+            ${toggleForm}
+            <form method="POST" action="/admin/games/${Number(g.id)}/delete" onsubmit="return confirm('بازی غیرفعال می‌شود. ادامه می‌دهید؟');">
+              <button class="btn btn--danger-ghost btn--sm" type="submit" title="حذف نرم">${icon("trash", 15)}</button>
             </form>
-            ${!g.active ? `<form method="POST" action="/admin/games/${g.id}/restore" style="display:inline;">
-              <button class="btn" type="submit">بازگردانی</button>
-            </form>` : ''}
-            <form method="POST" action="/admin/games/${g.id}" style="display:inline;">
-              <input type="hidden" name="title" value="${g.title}" />
-              <input type="hidden" name="platform" value="${g.platform || ''}" />
-              <input type="hidden" name="region" value="${g.region || ''}" />
-              <input type="hidden" name="capacity" value="${g.capacity || 0}" />
-              <input type="hidden" name="is_plus" value="${g.is_plus ? 1 : 0}" />
-              <input type="hidden" name="price" value="${g.price}" />
-              <input type="hidden" name="stock" value="${g.stock}" />
-              <input type="hidden" name="active" value="${g.active ? 0 : 1}" />
-              <input type="hidden" name="image_url" value="${g.image_url || ''}" />
-              <input type="hidden" name="description" value="${g.description || ''}" />
-              <input type="hidden" name="seo_title" value="${g.seo_title || ''}" />
-              <input type="hidden" name="seo_description" value="${g.seo_description || ''}" />
-              <input type="hidden" name="seo_tags" value="${g.seo_tags || ''}" />
-              <button class="btn" type="submit">${g.active ? 'Deactivate' : 'Activate'}</button>
+            ${
+              !g.active
+                ? `<form method="POST" action="/admin/games/${Number(g.id)}/restore">
+                    <button class="btn btn--sm" type="submit" title="بازگردانی">${icon("rotate", 15)}</button>
+                  </form>`
+                : ""
+            }
+            <form method="POST" action="/admin/games/${Number(g.id)}/purge" onsubmit="return confirm('حذف دائمی و غیرقابل بازگشت است. مطمئن هستید؟');">
+              <button class="btn btn--danger btn--sm" type="submit" title="حذف دائمی">${icon("alert", 15)}</button>
             </form>
-            <form method="POST" action="/admin/games/${g.id}/purge" style="display:inline;" onsubmit="return confirm('حذف دائمی و غیرقابل بازگشت است. مطمئن هستید؟');">
-              <button class="btn btn-danger" type="submit">حذف دائمی</button>
-            </form>
-          </td>
-        </tr>`;
-      }
-    )
+          </div>
+        </td>
+      </tr>`;
+    })
     .join("");
 
   const filterTitle = filters.title || "";
   const filterPlatform = filters.platform || "";
   const filterActive = filters.active ?? "";
 
+  const platformMax = Math.max(1, ...(summary.platform_breakdown || []).map((p) => Number(p.total) || 0));
+  const platformRows = (summary.platform_breakdown || [])
+    .map(
+      (p) => `<div class="platform-row">
+        <span class="chip chip--platform">${escapeHtml(p.platform)}</span>
+        <div class="platform-row__bar"><div class="platform-row__fill" style="width:${Math.round(((Number(p.total) || 0) / platformMax) * 100)}%"></div></div>
+        <span class="muted">${formatNumber(p.total)} واریانت · ${formatNumber(p.active)} فعال · موجودی ${formatNumber(p.stock)}</span>
+      </div>`
+    )
+    .join("") || '<p class="muted">داده‌ای برای نمایش وجود ندارد.</p>';
+
+  const recentGames = (summary.recent_games || [])
+    .map(
+      (item) => `<div class="chip" style="padding:8px 12px;">
+        <strong style="color:var(--text);">${escapeHtml(item.title)}</strong>
+        <span class="muted">${formatPrice(item.price)} · ${formatNumber(item.stock || 0)} عدد</span>
+        ${item.active ? '<span class="badge badge--success" style="font-size:10px; padding:0 7px;">فعال</span>' : '<span class="badge badge--danger" style="font-size:10px; padding:0 7px;">معلق</span>'}
+      </div>`
+    )
+    .join("") || '<p class="muted">هنوز بازی ثبت نشده است.</p>';
+
   const content = `
-    <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px;">
+    <div class="page-head">
       <div>
-        <p class="muted" style="margin:0;">GalaxyZone Control Center</p>
-        <h2 style="margin:4px 0 0 0;">مدیریت بازی‌ها</h2>
+        <h1>مرکز کنترل GalaxyZone</h1>
+        <p class="page-head__sub">مدیریت بازی‌ها، قیمت‌گذاری واریانت‌ها و مانیتورینگ موجودی — داده زنده از D1</p>
       </div>
-      <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
-        <span class="pill">API-first dashboard</span>
-        <a class="btn" href="/admin/games/new">ایجاد بازی جدید</a>
-      </div>
-    </div>
-
-    <div class="dashboard-grid">
-      <div class="stat-card">
-        <div class="stat-title">کل بازی‌ها</div>
-        <div class="stat-value">${summary.total_games ?? 0}</div>
-        <p class="muted" style="margin:4px 0 0 0;">فعال: ${summary.active_games ?? 0} | غیرفعال: ${summary.inactive_games ?? 0}</p>
-      </div>
-      <div class="stat-card">
-        <div class="stat-title">بازی‌های Plus</div>
-        <div class="stat-value">${summary.plus_games ?? 0}</div>
-        <p class="muted" style="margin:4px 0 0 0;">بازار هدف: پلیرهای وفادار</p>
-      </div>
-      <div class="stat-card">
-        <div class="stat-title">موجودی کل</div>
-        <div class="stat-value">${formatPrice(summary.total_stock ?? 0)}</div>
-        <p class="muted" style="margin:4px 0 0 0;">میانگین قیمت: ${formatPrice(summary.avg_price ?? 0)}</p>
-      </div>
-      <div class="stat-card">
-        <div class="stat-title">بازه قیمت</div>
-        <div class="stat-value">${formatPrice(summary.min_price ?? 0)} - ${formatPrice(summary.max_price ?? 0)}</div>
-        <p class="muted" style="margin:4px 0 0 0;">امنیت کوکی فعال است</p>
-      </div>
-      <div class="stat-card">
-        <div class="stat-title">ارزش موجودی</div>
-        <div class="stat-value">${formatPrice(summary.inventory_value ?? 0)}</div>
-        <p class="muted" style="margin:4px 0 0 0;">جمع قیمت × موجودی</p>
-      </div>
-      <div class="stat-card">
-        <div class="stat-title">هشدار موجودی کم</div>
-        <div class="stat-value">${summary.low_stock_games ?? 0}</div>
-        <p class="muted" style="margin:4px 0 0 0;">بازی با موجودی ۳ یا کمتر</p>
+      <div class="page-head__actions">
+        <span class="chip">${icon("code", 14)} API-first</span>
+        <a class="btn" href="/admin/games/new">${icon("plus", 16)} ایجاد بازی جدید</a>
       </div>
     </div>
 
-    <div class="api-card" style="margin-top:12px;">
-      <div style="display:flex; justify-content:space-between; gap:12px; align-items:center; flex-wrap:wrap;">
+    <div class="stats-grid">
+      <div class="stat-card">
+        <div class="stat-card__head">${icon("gamepad", 16)} کل بازی‌ها</div>
+        <div class="stat-card__value">${formatNumber(summary.total_games ?? 0)}</div>
+        <p class="stat-card__meta">فعال: ${formatNumber(summary.active_games ?? 0)} · غیرفعال: ${formatNumber(summary.inactive_games ?? 0)}</p>
+      </div>
+      <div class="stat-card">
+        <div class="stat-card__head">${icon("star", 16)} بازی‌های پلاس</div>
+        <div class="stat-card__value">${formatNumber(summary.plus_games ?? 0)}</div>
+        <p class="stat-card__meta">اشتراک‌های ویژه اعضا</p>
+      </div>
+      <div class="stat-card">
+        <div class="stat-card__head">${icon("box", 16)} موجودی کل</div>
+        <div class="stat-card__value">${formatNumber(summary.total_stock ?? 0)}</div>
+        <p class="stat-card__meta">میانگین قیمت: ${formatPrice(summary.avg_price ?? 0)} تومان</p>
+      </div>
+      <div class="stat-card">
+        <div class="stat-card__head">${icon("coins", 16)} بازه قیمت</div>
+        <div class="stat-card__value"><small>از</small> ${formatPrice(summary.min_price ?? 0)} <small>تا</small> ${formatPrice(summary.max_price ?? 0)}</div>
+        <p class="stat-card__meta">تومان — روی واریانت‌های فعال</p>
+      </div>
+      <div class="stat-card">
+        <div class="stat-card__head">${icon("wallet", 16)} ارزش موجودی</div>
+        <div class="stat-card__value">${formatPrice(summary.inventory_value ?? 0)} <small>تومان</small></div>
+        <p class="stat-card__meta">جمع (قیمت × موجودی)</p>
+      </div>
+      <div class="stat-card">
+        <div class="stat-card__head">${icon("alert", 16)} هشدار موجودی کم</div>
+        <div class="stat-card__value" style="color:${Number(summary.low_stock_games ?? 0) > 0 ? "var(--warning)" : "var(--success)"};">${formatNumber(summary.low_stock_games ?? 0)}</div>
+        <p class="stat-card__meta">واریانت با موجودی ۳ یا کمتر</p>
+      </div>
+    </div>
+
+    <div class="grid" style="grid-template-columns:repeat(auto-fit, minmax(320px, 1fr)); margin-bottom:18px;">
+      <div class="card">
+        <h3>${icon("chart", 18)} سهم پلتفرم‌ها</h3>
+        <p class="muted" style="margin-top:-6px;">توزیع واریانت‌های PS4 و PS5 بر اساس داده D1</p>
+        ${platformRows}
+      </div>
+      <div class="card card--glow">
+        <h3>${icon("code", 18)} APIهای مدیریتی</h3>
+        <p class="muted" style="margin-top:-6px;">دسترسی JSON امن برای ابزارهای شخص ثالث و اتوماسیون</p>
+        <div class="api-row"><span class="method-pill">GET</span><code class="code-pill" style="margin-top:0;">/admin/api/health</code></div>
+        <div class="api-row"><span class="method-pill">GET</span><code class="code-pill" style="margin-top:0;">/admin/api/summary</code></div>
+        <div class="api-row"><span class="method-pill">GET</span><code class="code-pill" style="margin-top:0;">/admin/api/games?platform=PS5</code></div>
+        <div class="divider"></div>
+        <p class="muted" style="margin:0 0 8px;">آخرین بازی‌های ثبت‌شده</p>
+        <div style="display:flex; gap:8px; flex-wrap:wrap;">${recentGames}</div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom:6px;">
+      <form method="GET" action="/admin" class="toolbar-form">
         <div>
-          <div class="chip">پلتفرم‌ها</div>
-          <h3 style="margin:8px 0 4px 0;">سهم بازار بر اساس پلتفرم</h3>
-          <p class="muted" style="margin:0;">نمای کلی بازی‌های PS4 و PS5 بر اساس داده D1</p>
+          <label for="af-title">جستجوی عنوان</label>
+          <input id="af-title" name="title" value="${escapeHtml(filterTitle)}" placeholder="مثال: God of War" />
         </div>
-        <div style="display:flex; gap:6px; flex-wrap:wrap;">${(summary.platform_breakdown || [])
-          .map(
-            (platform) => `<span class="pill">${platform.platform}: ${platform.total} بازی | ${platform.active} فعال | موجودی ${formatPrice(platform.stock)}</span>`
-          )
-          .join("") || '<span class="muted">داده‌ای وجود ندارد</span>'}</div>
-      </div>
-    </div>
-
-    <div class="api-card glow">
-      <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;">
         <div>
-          <div class="chip">REST API <span style="font-weight:800;">Secure</span></div>
-          <h3 style="margin:8px 0 4px 0;">API های مدیریتی</h3>
-          <p class="muted" style="margin:0;">دسترسی سریع به JSON برای ابزارهای شخص ثالث</p>
-        </div>
-        <div style="text-align:left;">
-          <code>GET /admin/api/summary</code>
-          <code>GET /admin/api/games?platform=PS5</code>
-          <code>GET /admin/api/health</code>
-        </div>
-      </div>
-      <div class="divider"></div>
-      <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:10px;">
-        ${(summary.recent_games || [])
-          .map(
-            (item) => `<div class="badge-ghost" style="padding:10px; border-radius:10px;">
-              <div style="display:flex; justify-content:space-between; align-items:center;">
-                <strong>${item.title}</strong>
-                ${item.active ? '<span class="badge">فعال</span>' : '<span class="badge plus">معلق</span>'}
-              </div>
-              <div class="muted">${formatPrice(item.price)} | ${item.stock || 0} موجودی</div>
-            </div>`
-          )
-          .join("")}
-      </div>
-    </div>
-
-    <form method="GET" action="/admin" class="grid" style="align-items:end; margin-top:18px;">
-      <div>
-        <label>عنوان
-          <input name="title" value="${filterTitle}" placeholder="مثال: God of War" />
-        </label>
-      </div>
-      <div>
-        <label>پلتفرم
-          <select name="platform">
+          <label for="af-platform">پلتفرم</label>
+          <select id="af-platform" name="platform">
             <option value="">همه</option>
-            <option value="PS4" ${filterPlatform === 'PS4' ? 'selected' : ''}>PS4</option>
-            <option value="PS5" ${filterPlatform === 'PS5' ? 'selected' : ''}>PS5</option>
+            <option value="PS4" ${filterPlatform === "PS4" ? "selected" : ""}>PS4</option>
+            <option value="PS5" ${filterPlatform === "PS5" ? "selected" : ""}>PS5</option>
           </select>
-        </label>
-      </div>
-      <div>
-        <label>وضعیت نمایش
-          <select name="active">
-            <option value="" ${filterActive === '' ? 'selected' : ''}>همه</option>
-            <option value="1" ${filterActive === '1' ? 'selected' : ''}>فعال</option>
-            <option value="0" ${filterActive === '0' ? 'selected' : ''}>غیرفعال</option>
+        </div>
+        <div>
+          <label for="af-active">وضعیت</label>
+          <select id="af-active" name="active">
+            <option value="" ${filterActive === "" ? "selected" : ""}>همه</option>
+            <option value="1" ${filterActive === "1" ? "selected" : ""}>فعال</option>
+            <option value="0" ${filterActive === "0" ? "selected" : ""}>غیرفعال</option>
           </select>
-        </label>
-      </div>
-      <div>
-        <button class="btn" type="submit">اعمال فیلتر</button>
-      </div>
-    </form>
-    <div class="muted">${games.length} نتیجه</div>
+        </div>
+        <div class="toolbar-form__actions">
+          <button class="btn" type="submit">${icon("filter", 15)} اعمال</button>
+          <a class="btn btn--ghost" href="/admin">${icon("rotate", 15)} پاک‌سازی</a>
+        </div>
+      </form>
+    </div>
+
+    <span class="result-count muted">${icon("gamepad", 14)} ${formatNumber(games.length)} نتیجه</span>
     <div class="table-wrapper">
       <table>
         <thead>
           <tr>
-            <th>ID</th><th>عنوان</th><th>ریجن</th><th>Plus</th><th>واریانت‌ها</th><th>قیمت پایه</th><th>موجودی کل</th><th>فعال</th><th>تصویر</th><th>توضیح</th><th>SEO Title</th><th>SEO Description</th><th>SEO Tags</th><th>اقدام</th>
+            <th scope="col">#</th>
+            <th scope="col">بازی</th>
+            <th scope="col">واریانت‌ها</th>
+            <th scope="col">قیمت پایه</th>
+            <th scope="col">موجودی</th>
+            <th scope="col">وضعیت</th>
+            <th scope="col">اقدامات</th>
           </tr>
         </thead>
-        <tbody>${rows}</tbody>
+        <tbody>${rows || '<tr><td colspan="7" style="text-align:center; padding:34px;" class="muted">بازی‌ای یافت نشد — اولین بازی را ایجاد کنید.</td></tr>'}</tbody>
       </table>
     </div>
   `;
-  return renderLayout(content, { title: "Admin | Games" });
+  return renderAdminShell(content, { title: "داشبورد | GalaxyZone Admin", activeNav: "dashboard" });
 }
 
 function renderAdminGameForm(game = null, variants = []) {
   const isEdit = Boolean(game);
-  const action = isEdit ? `/admin/games/${game.id}` : "/admin/games";
+  const action = isEdit ? `/admin/games/${Number(game.id)}` : "/admin/games";
   const existingVariants = {};
   (variants || []).forEach((v) => {
     existingVariants[`${v.platform?.toUpperCase?.() || v.platform}_${v.capacity}`] = v;
@@ -837,160 +1823,152 @@ function renderAdminGameForm(game = null, variants = []) {
     const key = `${platform}_${capacity}`;
     const v = existingVariants[key] || {};
     const activeChecked = v.is_active === undefined ? true : Boolean(v.is_active);
-    return `<div class="variant-row">
-      <div class="variant-row__title">
-        <span>${platform} | ظرفیت ${capacity}</span>
-        <label style="margin-top:0;">
+    return `<div class="variant-card" data-variant="${escapeHtml(platform)}_${capacity}">
+      <div class="variant-card__head">
+        <span class="chips">
+          <span class="chip chip--platform">${escapeHtml(platform)}</span>
+          <span class="chip chip--capacity">${formatNumber(capacity)} کاربره</span>
+        </span>
+        <label class="variant-card__toggle" style="margin-top:0;">
           <input type="hidden" name="variant_active_${platform}_${capacity}" value="0" />
-          <input type="checkbox" name="variant_active_${platform}_${capacity}" ${activeChecked ? "checked" : ""} /> فعال
+          <input type="checkbox" name="variant_active_${platform}_${capacity}" ${activeChecked ? "checked" : ""} />
+          فعال برای فروش
         </label>
       </div>
       <label>قیمت (تومان)
-        <input required type="number" min="0" name="variant_price_${platform}_${capacity}" value="${v.price ?? ""}" />
+        <input type="number" min="0" step="1000" inputmode="numeric" name="variant_price_${platform}_${capacity}" value="${v.price ?? ""}" placeholder="— ارائه نشده" />
       </label>
       <label>موجودی
-        <input type="number" min="0" name="variant_stock_${platform}_${capacity}" value="${v.stock ?? ""}" />
+        <input type="number" min="0" inputmode="numeric" name="variant_stock_${platform}_${capacity}" value="${v.stock ?? ""}" placeholder="0" />
       </label>
     </div>`;
   }).join("");
 
-  return renderLayout(`
-    <h2>${isEdit ? "ویرایش بازی" : "ایجاد بازی"}</h2>
+  const formScript = `
+    (function () {
+      var input = document.getElementById("imageUrlInput");
+      var preview = document.getElementById("imagePreview");
+      if (input && preview) {
+        var placeholder = preview.innerHTML;
+        var render = function () {
+          var url = input.value.trim();
+          preview.innerHTML = "";
+          if (url) {
+            var img = document.createElement("img");
+            img.alt = "پیش‌نمایش کاور";
+            img.onerror = function () {
+              preview.innerHTML = "⚠️ تصویر بارگذاری نشد";
+            };
+            img.src = url;
+            preview.appendChild(img);
+          } else {
+            preview.innerHTML = placeholder;
+          }
+        };
+        input.addEventListener("input", render);
+        render();
+      }
+      // Smart variant toggles: clearing a price auto-deactivates the variant,
+      // filling one auto-activates it (manual overrides stay until price changes).
+      document.querySelectorAll("input[name^='variant_price_']").forEach(function (priceInput) {
+        var name = priceInput.name.replace("variant_price_", "variant_active_");
+        var checkbox = document.querySelector("input[name='" + name + "']:not([type='hidden'])");
+        var card = priceInput.closest(".variant-card");
+        if (!checkbox) return;
+        var lastFilled = !!priceInput.value;
+        var sync = function () {
+          var filled = priceInput.value !== "" && Number(priceInput.value) > 0;
+          if (filled !== lastFilled) {
+            checkbox.checked = filled;
+            lastFilled = filled;
+          }
+          if (card) card.classList.toggle("is-off", !checkbox.checked || !filled);
+        };
+        priceInput.addEventListener("input", sync);
+        checkbox.addEventListener("change", function () {
+          if (card) card.classList.toggle("is-off", !checkbox.checked || !priceInput.value);
+        });
+        if (card) card.classList.toggle("is-off", !checkbox.checked || !priceInput.value);
+      });
+    })();`;
+
+  return renderAdminShell(
+    `
+    <div class="page-head">
+      <div>
+        <h1>${isEdit ? `ویرایش «${escapeHtml(game.title)}»` : "ایجاد بازی جدید"}</h1>
+        <p class="page-head__sub">اطلاعات محصول و ماتریس قیمت‌گذاری PS4/PS5 را در یک فرم مدیریت کنید</p>
+      </div>
+      ${isEdit ? `<a class="btn btn--ghost" href="/game/${Number(game.id)}" target="_blank" rel="noopener">${icon("external", 15)} مشاهده در فروشگاه</a>` : ""}
+    </div>
+
     <form method="POST" action="${action}">
-      <div class="form-card">
-        <h3>اطلاعات کلی</h3>
+      <div class="card" style="margin-bottom:16px;">
+        <h3>${icon("gamepad", 18)} اطلاعات کلی</h3>
         <div class="form-grid">
-          <label>عنوان
-            <input required name="title" value="${game?.title || ""}" />
+          <label>عنوان بازی
+            <input required name="title" value="${escapeHtml(game?.title || "")}" placeholder="مثال: God of War Ragnarök" />
           </label>
           <label>ریجن
-            <input required name="region" value="${game?.region || ""}" />
+            <input required name="region" value="${escapeHtml(game?.region || "")}" placeholder="مثال: EU / US" />
           </label>
-          <label>+Plus
-            <input type="checkbox" name="is_plus" ${game?.is_plus ? "checked" : ""} />
+          <label style="justify-content:flex-end;">اشتراک پلاس
+            <span style="display:flex; align-items:center; gap:8px; color:var(--text-muted); font-weight:600;">
+              <input type="checkbox" name="is_plus" ${game?.is_plus ? "checked" : ""} style="width:18px; height:18px;" />
+              این محصول پلاس است
+            </span>
           </label>
-          <label>فعال
-            <input type="checkbox" name="active" ${game?.active ?? true ? "checked" : ""} />
+          <label style="justify-content:flex-end;">وضعیت انتشار
+            <span style="display:flex; align-items:center; gap:8px; color:var(--text-muted); font-weight:600;">
+              <input type="checkbox" name="active" ${game?.active ?? true ? "checked" : ""} style="width:18px; height:18px;" />
+              نمایش در فروشگاه
+            </span>
           </label>
-          <label>لینک تصویر
-            <input name="image_url" value="${game?.image_url || ""}" />
+          <label class="full-width">لینک تصویر کاور
+            <input name="image_url" dir="ltr" value="${escapeHtml(game?.image_url || "")}" placeholder="https://…" id="imageUrlInput" />
           </label>
-          <label>SEO Title
-            <input name="seo_title" value="${game?.seo_title || ""}" />
+          <div class="full-width image-preview" id="imagePreview">${icon("image", 30)}</div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-bottom:16px;">
+        <h3>${icon("coins", 18)} ماتریس قیمت‌گذاری</h3>
+        <p class="muted" style="margin-top:-6px;">برای هر پلتفرم (PS4 / PS5) و هر ظرفیت (۱، ۲، ۳ کاربره) قیمت، موجودی و وضعیت فعال را مشخص کنید. ارزان‌ترین واریانت فعال، قیمت پایه محصول خواهد بود.</p>
+        <div class="grid" style="grid-template-columns:repeat(auto-fit, minmax(230px, 1fr));">${variantRows}</div>
+      </div>
+
+      <div class="card" style="margin-bottom:16px;">
+        <h3>${icon("tag", 18)} سئو و توضیحات</h3>
+        <div class="form-grid">
+          <label>عنوان سئو
+            <input name="seo_title" value="${escapeHtml(game?.seo_title || "")}" placeholder="${escapeHtml(game?.title || "عنوان صفحه در نتایج جستجو")}" />
           </label>
-          <label>SEO Tags (comma-separated)
-            <input name="seo_tags" value="${game?.seo_tags || ""}" />
+          <label>برچسب‌ها (با کاما جدا کنید)
+            <input name="seo_tags" dir="ltr" value="${escapeHtml(game?.seo_tags || "")}" placeholder="action, adventure" />
           </label>
-          <label class="full-width">SEO Description
-            <textarea name="seo_description">${game?.seo_description || ""}</textarea>
+          <label class="full-width">توضیح متای سئو
+            <textarea name="seo_description" maxlength="300">${escapeHtml(game?.seo_description || "")}</textarea>
           </label>
-          <label class="full-width">توضیح کامل
-            <textarea name="description">${game?.description || ""}</textarea>
+          <label class="full-width">توضیح کامل محصول
+            <textarea name="description" style="min-height:130px;">${escapeHtml(game?.description || "")}</textarea>
           </label>
         </div>
       </div>
-      <div class="form-card">
-        <h3>ماتریس قیمت‌گذاری</h3>
-        <p class="muted">برای هر پلتفرم (PS4/PS5) و ظرفیت (۱،۲،۳) قیمت، موجودی و وضعیت فعال را یکجا وارد کنید.</p>
-        <div class="variant-matrix">${variantRows}</div>
-      </div>
-      <div style="display:flex; gap:10px; margin-top:14px; flex-wrap:wrap;">
-        <button class="btn" type="submit">${isEdit ? "ثبت تغییرات" : "ایجاد"}</button>
-        <a class="btn btn-secondary" href="/admin">بازگشت</a>
+
+      <div class="form-actions">
+        <button class="btn" type="submit">${icon("check", 16)} ${isEdit ? "ثبت تغییرات" : "ایجاد بازی"}</button>
+        <a class="btn btn--ghost" href="/admin">${icon("arrow", 15)} بازگشت به داشبورد</a>
+        <span class="muted">${isEdit ? `شناسه محصول: ${Number(game.id)}` : "قیمت پایه به‌صورت خودکار از ارزان‌ترین واریانت فعال محاسبه می‌شود."}</span>
       </div>
     </form>
-  `, { title: isEdit ? `Edit ${game.title}` : "Create Game" });
+    `,
+    {
+      title: isEdit ? `ویرایش ${game.title} | GalaxyZone Admin` : "بازی جدید | GalaxyZone Admin",
+      activeNav: isEdit ? "" : "new",
+      script: formScript,
+    }
+  );
 }
-
-function renderStorefront(games) {
-  const cards = games
-    .map(
-      (g) => {
-        const variants = (g.variants || [])
-          .map((v) => `<div class="badge-ghost" style="display:inline-block; margin:2px;">${v.platform.toUpperCase()} | ظرفیت ${v.capacity} | ${formatPrice(v.price)} تومان</div>`)
-          .join("") || `<div class="badge-ghost">${g.platform} | ظرفیت ${g.capacity}</div>`;
-        return `<article style="background:#0f132b; border:1px solid #1f2a55; padding:12px; border-radius:12px;">
-          <h3>${g.title} ${g.is_plus ? '<span class="badge plus">+Plus</span>' : ''}</h3>
-          <div class="muted">${g.region}</div>
-          ${g.image_url ? `<img src="${g.image_url}" alt="${g.title}" style="max-width:100%; border-radius:10px; margin:8px 0;" />` : ''}
-          <p>${truncate(g.description, 120)}</p>
-          <div style="display:flex; justify-content:space-between; align-items:center;">
-            <strong>${g.display_price} تومان</strong>
-            ${g.out_of_stock ? '<span class="badge" style="background:#c62828;">ناموجود</span>' : '<span class="badge">موجود</span>'}
-          </div>
-          <div class="muted" style="margin-top:6px;">${variants}</div>
-          <div class="muted">برچسب‌ها: ${g.seo_tags || '---'}</div>
-        </article>`;
-      }
-    )
-    .join("");
-
-  return `<!DOCTYPE html>
-  <html lang="fa" dir="rtl">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>فروشگاه بازی | GalaxyZone</title>
-    <meta name="description" content="${CONFIG.DEFAULT_META_DESCRIPTION}" />
-    <style>
-      body { font-family:'Vazirmatn', sans-serif; background:#0b0d1a; color:#e9ecf5; margin:0; }
-      .container { max-width:1100px; margin:0 auto; padding:16px; }
-      h1 { margin:0 0 12px 0; }
-      .grid { display:grid; gap:12px; grid-template-columns:repeat(auto-fit, minmax(260px, 1fr)); }
-      .badge { display:inline-block; padding:2px 8px; border-radius:8px; background:#2e7d32; color:#fff; font-size:12px; }
-      .plus { background:#c2185b; }
-      .muted { color:#9ea7c6; font-size:12px; }
-    </style>
-  </head>
-  <body>
-    <div class="container">
-      <h1>فروشگاه بازی‌ها</h1>
-      <p class="muted">داده‌ها مستقیماً از Cloudflare D1 بارگذاری می‌شوند.</p>
-      <div class="grid">${cards}</div>
-    </div>
-  </body>
-  </html>`;
-}
-
-function renderGameDetail(game) {
-  const variants = (game.variants || [])
-    .map(
-      (v) => `<div class="badge-ghost" style="margin:4px 0; display:inline-block;">${v.platform.toUpperCase()} | ظرفیت ${v.capacity} | ${formatPrice(v.price)} تومان ${v.stock <= 0 ? '(ناموجود)' : ''}</div>`
-    )
-    .join("") || "";
-  return `<!DOCTYPE html>
-  <html lang="fa" dir="rtl">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>${game.seo_title || game.title}</title>
-    <meta name="description" content="${game.seo_description || game.description || CONFIG.DEFAULT_META_DESCRIPTION}" />
-    <style>
-      body { font-family:'Vazirmatn', sans-serif; background:#0b0d1a; color:#e9ecf5; margin:0; }
-      .container { max-width:800px; margin:0 auto; padding:16px; }
-      img { max-width:100%; border-radius:12px; }
-      .badge { display:inline-block; padding:2px 8px; border-radius:8px; background:#2e7d32; color:#fff; font-size:12px; }
-      .plus { background:#c2185b; }
-      .muted { color:#9ea7c6; font-size:12px; }
-      .tag { display:inline-block; margin:2px; padding:4px 8px; background:#0f142d; border:1px solid #1f2a55; border-radius:6px; }
-    </style>
-  </head>
-  <body>
-    <div class="container">
-      <a href="/store" class="muted">بازگشت به فروشگاه</a>
-      <h1>${game.title} ${game.is_plus ? '<span class="badge plus">+Plus</span>' : ''}</h1>
-      <div class="muted">${game.region}</div>
-      ${game.image_url ? `<img src="${game.image_url}" alt="${game.title}" />` : ''}
-      <p>${game.description || ''}</p>
-      <div><strong>قیمت:</strong> ${formatPrice(game.price)} تومان</div>
-      <div class="muted">${game.out_of_stock ? 'ناموجود' : 'موجود'}</div>
-      <div>${variants}</div>
-      <div>${(game.seo_tags || '').split(',').filter(Boolean).map((t) => `<span class="tag">${t.trim()}</span>`).join('')}</div>
-    </div>
-  </body>
-  </html>`;
-}
-
 // ============================================================
 // SECTION 5: ROUTING (New paths layered before legacy router)
 // ============================================================
@@ -1133,19 +2111,32 @@ async function handleRequest(request, env, ctx) {
   // Public API list
   if (url.pathname === "/games" && request.method === "GET") {
     const filters = {
+      title: url.searchParams.get("title") || undefined,
       platform: url.searchParams.get("platform") || undefined,
       region: url.searchParams.get("region") || undefined,
       capacity: url.searchParams.get("capacity") || undefined,
       is_plus: url.searchParams.get("is_plus") ? url.searchParams.get("is_plus") === "1" : undefined,
     };
     const games = await listPublicGames(env, filters);
-    return jsonResponse({ games });
+    return jsonResponse({ total: games.length, filters, games });
   }
 
-  // Storefront page
+  // Storefront page (filters mirror the /games JSON API contract)
   if (url.pathname === "/store" && request.method === "GET") {
-    const games = await listPublicGames(env);
-    return htmlResponse(renderStorefront(games));
+    const rawFilters = {
+      title: url.searchParams.get("title") || "",
+      platform: url.searchParams.get("platform") || "",
+      capacity: url.searchParams.get("capacity") || "",
+      is_plus: url.searchParams.get("is_plus") || "",
+    };
+    const apiFilters = {
+      title: rawFilters.title || undefined,
+      platform: rawFilters.platform || undefined,
+      capacity: rawFilters.capacity || undefined,
+      is_plus: rawFilters.is_plus ? rawFilters.is_plus === "1" : undefined,
+    };
+    const games = await listPublicGames(env, apiFilters);
+    return htmlResponse(renderStorefront(games, rawFilters, url.origin));
   }
 
   // Game detail
@@ -1153,14 +2144,23 @@ async function handleRequest(request, env, ctx) {
   if (gameDetailMatch && request.method === "GET") {
     const game = await getGameById(env, gameDetailMatch[1]);
     if (!game || !game.active) return null; // fall back to legacy 404
+    const variantsMap = await getVariantsForGames(env, [game.id]);
+    const variants = variantsMap[game.id] || [];
+    // Related games: cheapest-platform siblings, exclude self
+    const relatedPool = await listPublicGames(env, { platform: game.platform });
+    const related = relatedPool.filter((g) => g.id !== game.id).slice(0, 4);
+    const summary = summarizeVariants(variants);
     const enriched = {
       ...game,
+      variants,
+      price: summary.cheapest?.price ?? game.price ?? 0,
+      stock: summary.totalStock || game.stock || 0,
       is_plus: Boolean(game.is_plus),
-      out_of_stock: Number(game.stock) <= 0,
+      out_of_stock: Number(summary.totalStock || game.stock || 0) <= 0,
       seo_title: game.seo_title || game.title,
       seo_description: game.seo_description || game.description || CONFIG.DEFAULT_META_DESCRIPTION,
     };
-    return htmlResponse(renderGameDetail(enriched));
+    return htmlResponse(renderGameDetail(enriched, related, url.origin));
   }
 
   return null; // allow legacy router to respond
